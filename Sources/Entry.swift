@@ -4,13 +4,24 @@ import AppKit
 // Represents a text block with its content
 class TextItem: Identifiable, ObservableObject {
     let id = UUID()
-    @Published var content: String
+    @Published var attributedContent: NSAttributedString
     @Published var cursorPosition: Int?
     var currentCursorPosition: Int = 0  // Track current cursor for drops
 
     init(content: String = "") {
-        self.content = content
+        self.attributedContent = NSAttributedString(string: content)
         self.cursorPosition = nil
+    }
+
+    init(attributedContent: NSAttributedString) {
+        self.attributedContent = attributedContent
+        self.cursorPosition = nil
+    }
+
+    // Convenience property for plain text access
+    var content: String {
+        get { attributedContent.string }
+        set { attributedContent = NSAttributedString(string: newValue) }
     }
 }
 
@@ -103,23 +114,40 @@ class BlogEntry: ObservableObject {
             newItems.append(.text(TextItem()))
         }
 
-        for (index, item) in items.enumerated() {
-            newItems.append(item)
+        var i = 0
+        while i < items.count {
+            let item = items[i]
 
-            // Add text item between consecutive non-text items
-            if index < items.count - 1 {
-                let nextItem = items[index + 1]
-                if !isTextItem(item) && !isTextItem(nextItem) {
-                    newItems.append(.text(TextItem()))
-                } else if isTextItem(item) && isTextItem(nextItem) {
-                    // Skip duplicate text items
+            // Check if this is a text item followed by another text item
+            if isTextItem(item) && i < items.count - 1 && isTextItem(items[i + 1]) {
+                // Merge the two text items
+                if case .text(let textItem1) = item, case .text(let textItem2) = items[i + 1] {
+                    let mergedContent = textItem1.content.isEmpty && textItem2.content.isEmpty ? "" :
+                                       textItem1.content.isEmpty ? textItem2.content :
+                                       textItem2.content.isEmpty ? textItem1.content :
+                                       textItem1.content + "\n\n" + textItem2.content
+                    let mergedItem = TextItem(content: mergedContent)
+                    newItems.append(.text(mergedItem))
+                    i += 2  // Skip both items
                     continue
                 }
             }
+
+            newItems.append(item)
+
+            // Add text item between consecutive non-text items
+            if i < items.count - 1 {
+                let nextItem = items[i + 1]
+                if !isTextItem(item) && !isTextItem(nextItem) {
+                    newItems.append(.text(TextItem()))
+                }
+            }
+
+            i += 1
         }
 
         // Add text item at end if last item isn't text
-        if let last = items.last, !isTextItem(last) {
+        if let last = newItems.last, !isTextItem(last) {
             newItems.append(.text(TextItem()))
         }
 
