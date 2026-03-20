@@ -1,3 +1,5 @@
+// Copyright © 2026 Randy Wilson. All rights reserved.
+
 import Foundation
 
 // Represents a single article entry (draft or published)
