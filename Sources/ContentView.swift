@@ -1,5 +1,6 @@
 import SwiftUI
 
+
 extension Color {
     init(hex: String) {
         let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
@@ -19,17 +20,186 @@ extension Color {
     }
 }
 
-struct ContentView: View {
-    @StateObject private var entry = BlogEntry()
-    @State private var showVideoDialog = false
-    @State private var selectedItemId: UUID? = nil
-    @State private var focusedTextItemId: UUID? = nil
-    @State private var selectedItemIds: Set<UUID> = []
-    @State private var clipboard: [EntryItem] = []
-    @State private var focusedTextView: CustomNSTextView? = nil
-    @State private var activeFormats: Set<FormattingType> = []
+struct LoadProgressOverlay: View {
+    let current: Int
+    let total: Int
 
     var body: some View {
+        ZStack {
+            Color.black.opacity(0.4)
+            VStack(spacing: 12) {
+                Text("Loading images…")
+                    .font(.headline)
+                ProgressView(value: Double(current), total: Double(max(total, 1)))
+                    .frame(width: 280)
+                Text("\(current) of \(total)")
+                    .foregroundColor(.secondary)
+            }
+            .padding(24)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        }
+        .ignoresSafeArea()
+    }
+}
+
+struct ImportProgressOverlay: View {
+    let current: Int
+    let total: Int
+    let onCancel: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.4)
+            VStack(spacing: 12) {
+                Text("Importing images…")
+                    .font(.headline)
+                ProgressView(value: Double(current), total: Double(max(total, 1)))
+                    .frame(width: 280)
+                Text("\(current) of \(total)")
+                    .foregroundColor(.secondary)
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.escape, modifiers: [])
+            }
+            .padding(24)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        }
+        .ignoresSafeArea()
+    }
+}
+
+// Registry mapping TextItem IDs → their live NSTextView instances.
+// Used by the find bar to apply highlights directly without routing through SwiftUI state.
+class FindRegistry: ObservableObject {
+    var textViews: [UUID: CustomNSTextView] = [:]
+}
+
+struct FindBarView: View {
+    @Binding var query: String
+    let focusToken: Int
+    let matchCount: Int
+    let currentIndex: Int  // -1 when no matches
+    let onPrevious: () -> Void
+    let onNext: () -> Void
+    let onClose: () -> Void
+
+    @FocusState private var fieldFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundColor(.secondary)
+                .font(.system(size: 12))
+
+            TextField("Find…", text: $query)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 220)
+                .focused($fieldFocused)
+                .onSubmit { onNext() }
+
+            if !query.isEmpty {
+                if matchCount == 0 {
+                    Text("No matches")
+                        .foregroundColor(.red)
+                        .font(.caption)
+                } else {
+                    Text("\(currentIndex + 1) of \(matchCount)")
+                        .foregroundColor(.secondary)
+                        .font(.caption)
+                        .frame(minWidth: 64, alignment: .leading)
+                }
+            }
+
+            Button(action: onPrevious) {
+                Image(systemName: "chevron.up")
+                    .font(.system(size: 11, weight: .medium))
+            }
+            .buttonStyle(.borderless)
+            .disabled(matchCount == 0)
+            .help("Find Previous (⌘⇧G)")
+
+            Button(action: onNext) {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 11, weight: .medium))
+            }
+            .buttonStyle(.borderless)
+            .disabled(matchCount == 0)
+            .help("Find Next (⌘G)")
+
+            Button(action: onClose) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundColor(.secondary)
+                    .font(.system(size: 14))
+            }
+            .buttonStyle(.borderless)
+            .keyboardShortcut(.escape, modifiers: [])
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Color(NSColor.controlBackgroundColor))
+        .onAppear { fieldFocused = true }
+        .onChange(of: focusToken) { _, _ in fieldFocused = true }
+    }
+}
+
+struct ContentView: View {
+    @StateObject private var entry = BlogEntry()
+    @StateObject private var undoCoordinator = UndoCoordinator()
+    @State private var showVideoDialog = false
+    @State private var pendingVideoDropIndex: Int = 0
+    @State private var pendingVideoCursorPosition: Int? = nil
+    @State private var selectedItemId: UUID? = nil
+    @State private var captionEditingId: UUID? = nil
+    @State private var focusedTextItemId: UUID? = nil
+    @State private var previousTitle: String = ""
+    @State private var selectedItemIds: Set<UUID> = []
+    @State private var clipboard: [EntryItem] = []
+    @State private var clipboardPasteboardCount: Int = -1 // NSPasteboard changeCount when clipboard was last populated
+    @State private var focusedTextView: CustomNSTextView? = nil
+    @State private var activeFormats: Set<FormattingType> = []
+    @StateObject private var articleManager = ArticleManager()
+
+    // Save functionality state
+    @FocusState private var titleFieldFocused: Bool
+    @State private var isLoadingArticle = false   // suppresses triggerFolderRename during programmatic changes
+    @State private var showUrlUpdateAlert = false
+    @State private var pendingFolderName = ""
+    @State private var pendingOldGCSFolder = ""
+    @State private var autoSaveTimer: Timer?
+    @State private var showSaveError = false
+    @State private var saveErrorMessage = ""
+
+    // Publish state
+    enum PublishState { case idle, publishing, success(URL), failure(String) }
+    @State private var publishState: PublishState = .idle
+    @State private var articleDate = Date()
+    @State private var gcsBucket: String = UserDefaults.standard.string(forKey: "GCSBucket") ?? ""
+    @State private var showSyncError = false
+    @State private var syncErrorMessage = ""
+    @State private var isSyncing = false
+    @State private var showRegenerateIndexError = false
+    @State private var regenerateIndexErrorMessage = ""
+    @State private var syncProgressCompleted: Int = 0
+    @State private var syncProgressTotal: Int? = nil
+    @State private var syncProgressFiles: [String] = []
+    @State private var showSyncProgress = false
+
+    // Import state
+    @State private var importProgress: (current: Int, total: Int)? = nil
+    @State private var importTask: Task<Void, Never>? = nil
+
+    // Load state
+    @State private var loadProgress: (current: Int, total: Int)? = nil
+
+    // Find state
+    @StateObject private var findRegistry = FindRegistry()
+    @State private var showFindBar = false
+    @State private var findFocusToken = 0
+    @State private var findQuery = ""
+    @State private var findMatches: [(itemId: UUID, range: NSRange, isCaption: Bool)] = []
+    @State private var currentMatchIndex = -1
+    @State private var findScrollTargetId: UUID? = nil
+
+    @ViewBuilder private var editorPanel: some View {
         VStack(spacing: 0) {
             // Formatting toolbar
             FormattingToolbar(
@@ -47,41 +217,183 @@ struct ContentView: View {
             Divider()
 
             // Title bar
-            HStack {
-                TextField("Entry Title", text: $entry.title)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.title)
+            VStack(spacing: 8) {
+                HStack {
+                    TextField("Entry Title", text: Binding(
+                        get: { entry.title },
+                        set: { newValue in
+                            if !undoCoordinator.isRestoring && previousTitle != newValue {
+                                undoCoordinator.commitTypingIfNeeded(
+                                    entry: entry,
+                                    focusedTextItemId: focusedTextItemId,
+                                    selectedItemId: selectedItemId
+                                )
+                                undoCoordinator.takeSnapshot(
+                                    entry: entry,
+                                    actionName: "Title Change",
+                                    focusedTextItemId: focusedTextItemId,
+                                    selectedItemId: selectedItemId
+                                )
+                                entry.title = newValue
+                                undoCoordinator.commitAction(
+                                    entry: entry,
+                                    focusedTextItemId: focusedTextItemId,
+                                    selectedItemId: selectedItemId
+                                )
+                                previousTitle = newValue
+                            } else {
+                                entry.title = newValue
+                            }
+                        }
+                    ))
+                        .focused($titleFieldFocused)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.title)
+                        .onSubmit { triggerFolderRename() }
 
-                Spacer()
+                    Spacer()
 
-                Button("Add Video") {
-                    showVideoDialog = true
+                    Button("Save") {
+                        saveEntry(isManualSave: true)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(entry.isDirty ?
+                          Color(red: 200/255, green: 200/255, blue: 236/255) :
+                          Color(red: 200/255, green: 236/255, blue: 200/255))
+
+                    Button("Add Video") {
+                        // Capture cursor position before the sheet steals focus
+                        if let id = focusedTextItemId,
+                           let idx = entry.items.firstIndex(where: { $0.id == id }),
+                           case .text(let textItem) = entry.items[idx] {
+                            pendingVideoDropIndex = idx
+                            pendingVideoCursorPosition = textItem.currentCursorPosition
+                        } else {
+                            pendingVideoDropIndex = max(0, entry.items.count - 1)
+                            pendingVideoCursorPosition = nil
+                        }
+                        // Resign first responder now so that when insertVideo mutates
+                        // textItem.content the updateNSView guard (firstResponder != textView)
+                        // allows the NSTextView to be updated from the model.
+                        focusedTextView?.window?.makeFirstResponder(nil)
+                        showVideoDialog = true
+                    }
+
+                    Button("Preview") {
+                        previewEntry()
+                    }
+
+                    // Publish / Update button
+                    Group {
+                        if case .publishing = publishState {
+                            HStack(spacing: 4) {
+                                ProgressView().controlSize(.small)
+                                Text(isPublished ? "Updating…" : "Publishing…")
+                                    .foregroundColor(.secondary)
+                            }
+                        } else if case .success(let url) = publishState {
+                            Button(isPublished ? "Updated ✓" : "Published ✓") {
+                                // For published articles with a bucket, open the live remote URL.
+                                // For drafts just promoted to TravelBlog, open the local file.
+                                if isPublished,
+                                   !gcsBucket.isEmpty,
+                                   let folder = entry.filePath?.deletingLastPathComponent().lastPathComponent,
+                                   let remoteURL = URL(string: "https://\(gcsBucket)/\(folder)/") {
+                                    NSWorkspace.shared.open(remoteURL)
+                                } else {
+                                    NSWorkspace.shared.open(url)
+                                }
+                            }
+                            .foregroundColor(.green)
+                        } else if isPublished {
+                            Button("Update") {
+                                Task { await updateToGCS() }
+                            }
+                            .disabled(gcsBucket.isEmpty)
+                            .help(gcsBucket.isEmpty
+                                  ? "Enter a GCS bucket name to enable Update"
+                                  : "Regenerate images, update index, and sync this article to GCS")
+                        } else {
+                            Button("Publish") {
+                                Task { await publishToTravelBlog(date: articleDate) }
+                            }
+                        }
+                    }
+
                 }
 
-                Button("Export HTML") {
-                    exportHTML()
-                }
+                // Date + folder name + GCS bucket
+                HStack(spacing: 6) {
+                    DatePicker("", selection: $articleDate, displayedComponents: .date)
+                        .datePickerStyle(.compact)
+                        .labelsHidden()
+                        .onChange(of: articleDate) { _, _ in
+                            triggerFolderRename()
+                        }
 
-                Button("Send Email") {
-                    sendEmail()
+                    Text("•").foregroundColor(.secondary)
+
+                    Text(currentFolderName)
+                        .foregroundColor(.secondary)
+
+                    Spacer()
+
+                    Text(mediaCount == 1 ? "1 image" : "\(mediaCount) images")
+                        .foregroundColor(.secondary)
+
+                    Text("GCS:")
+                        .foregroundColor(.secondary)
+                    TextField("bucket-name", text: $gcsBucket)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 160)
+                        .onChange(of: gcsBucket) { _, newValue in
+                            UserDefaults.standard.set(newValue, forKey: "GCSBucket")
+                        }
                 }
+                .font(.caption)
             }
             .padding()
             .background(Color(NSColor.controlBackgroundColor))
 
             Divider()
 
+            if showFindBar {
+                FindBarView(
+                    query: $findQuery,
+                    focusToken: findFocusToken,
+                    matchCount: findMatches.count,
+                    currentIndex: currentMatchIndex,
+                    onPrevious: findPrevious,
+                    onNext: findNext,
+                    onClose: closeFindBar
+                )
+                .onChange(of: findQuery) { _, _ in computeFindMatches() }
+                Divider()
+            }
+
             // Main content area
             EntryContentView(
                 entry: entry,
                 selectedItemId: $selectedItemId,
+                captionEditingId: $captionEditingId,
                 focusedTextItemId: $focusedTextItemId,
                 selectedItemIds: $selectedItemIds,
+                findScrollTargetId: $findScrollTargetId,
                 onNavigateUp: navigateUp,
                 onNavigateDown: navigateDown,
                 onDrop: handleDrop,
                 onDelete: handleDelete,
                 onArrowKey: handleArrowKey,
+                onEnterKey: handleEnterKey,
+                onEscapeKey: {
+                    if showFindBar {
+                        closeFindBar()
+                    } else {
+                        selectedItemId = nil
+                        selectedItemIds.removeAll()
+                    }
+                },
+                onUpdateCaption: updateImageCaption,
                 onImageTap: handleImageTap,
                 onVideoTap: handleVideoTap,
                 onPaste: handlePaste,
@@ -91,19 +403,201 @@ struct ContentView: View {
                 },
                 onSelectionChanged: {
                     updateActiveFormats()
-                }
+                },
+                onImageURLsDrop: { urls, index, cursorPos in
+                    importImages(urls: urls, at: index, cursorPosition: cursorPos)
+                },
+                onTextDidChange: {
+                    undoCoordinator.handleTyping(
+                        entry: entry,
+                        focusedTextItemId: focusedTextItemId,
+                        selectedItemId: selectedItemId
+                    )
+                },
+                onUndo: performUndo,
+                onRedo: performRedo
             )
+            .overlay {
+                if let progress = importProgress {
+                    ImportProgressOverlay(current: progress.current, total: progress.total) {
+                        importTask?.cancel()
+                    }
+                } else if let progress = loadProgress {
+                    LoadProgressOverlay(current: progress.current, total: progress.total)
+                }
+            }
         }
-        .frame(minWidth: 800, minHeight: 600)
+    }
+
+    var body: some View {
+        mainLayout
+            .focusedValue(\.undoCoordinator, undoCoordinator)
+            .focusedValue(\.undoAction, performUndo)
+            .focusedValue(\.redoAction, performRedo)
+            .focusedValue(\.syncAction, gcsBucket.isEmpty || isSyncing ? nil : syncToGCSSync)
+            .focusedValue(\.regenerateIndexAction, regenerateIndex)
+            .focusedValue(\.applyFormattingAction, applyFormatting)
+            .focusedValue(\.findAction, openFind)
+            .focusedValue(\.findNextAction, findNext)
+            .focusedValue(\.findPreviousAction, findPrevious)
+            .focusedValue(\.newEntryAction, createNewArticle)
+    }
+
+    private var mediaCount: Int {
+        entry.items.filter {
+            if case .image = $0 { return true }
+            if case .video = $0 { return true }
+            return false
+        }.count
+    }
+
+    private var mainLayout: some View {
+        HSplitView {
+            ArticleSidebarView(
+                articles: articleManager.articles,
+                selectedFolderURL: entry.filePath?.deletingLastPathComponent(),
+                onSelect: loadArticle,
+                onNew: createNewArticle
+            )
+            .frame(minWidth: 180, idealWidth: 220, maxWidth: 350)
+
+            editorPanel
+        }
+        .frame(minWidth: 900, minHeight: 600)
+        .environmentObject(findRegistry)
         .sheet(isPresented: $showVideoDialog) {
-            VideoDialogView(entry: entry)
+            VideoDialogView(onAdd: { url, title in
+                entry.insertVideo(url: url, title: title,
+                                  at: pendingVideoDropIndex,
+                                  cursorPosition: pendingVideoCursorPosition)
+                // Move focus to the text item that follows the new video
+                let newFocusIndex = pendingVideoDropIndex + 2
+                if newFocusIndex < entry.items.count,
+                   case .text(let nextText) = entry.items[newFocusIndex] {
+                    focusedTextItemId = nextText.id
+                }
+                undoCoordinator.commitAction(entry: entry,
+                                             focusedTextItemId: focusedTextItemId,
+                                             selectedItemId: selectedItemId)
+            })
+        }
+        .alert("Sync Failed", isPresented: $showSyncError) {
+            Button("OK") { showSyncError = false }
+        } message: {
+            Text(syncErrorMessage)
+        }
+        .sheet(isPresented: $showSyncProgress) {
+            SyncProgressSheet(
+                completed: syncProgressCompleted,
+                total: syncProgressTotal,
+                recentFiles: syncProgressFiles
+            )
         }
         .background(CutPasteHandler(
             canCut: canCut(),
             canPaste: canPaste(),
+            canUndo: undoCoordinator.canUndo,
+            canRedo: undoCoordinator.canRedo,
             onCut: handleCut,
-            onPaste: handlePaste
+            onPaste: { _ = handlePaste() },
+            onUndo: performUndo,
+            onRedo: performRedo
         ))
+        .task {
+            // Set up auto-save timer
+            autoSaveTimer = Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { _ in
+                if entry.isDirty {
+                    saveEntry(isManualSave: false)
+                }
+            }
+
+            // Load from last saved path — try stored path, then fall back to index.html in same folder
+            let urlToLoad: URL?
+            if let lastPath = SaveCoordinator.loadLastFilePath() {
+                if FileManager.default.fileExists(atPath: lastPath.path) {
+                    urlToLoad = lastPath
+                } else {
+                    // Legacy path may point to <name>.html; try index.html in the same folder
+                    let indexURL = lastPath.deletingLastPathComponent()
+                        .appendingPathComponent("index.html")
+                    urlToLoad = FileManager.default.fileExists(atPath: indexURL.path) ? indexURL : nil
+                }
+            } else {
+                urlToLoad = nil
+            }
+
+            if let url = urlToLoad {
+                do {
+                    // Backfill missing small/ JPEGs before populating entry so ImageItemViews
+                    // always find the files ready on their first onAppear.
+                    let startFolder = url.deletingLastPathComponent()
+                    await Task.detached(priority: .userInitiated) {
+                        TravelBlogPublisher.generateMissingSmallImages(in: startFolder)
+                    }.value
+                    try await HTMLParser.load(from: url, into: entry)
+                    previousTitle = entry.title
+                    print("Loaded from: \(url.path)")
+                    await generateMissingWebImages(baseURL: url.deletingLastPathComponent())
+                } catch {
+                    print("Failed to load HTML: \(error)")
+                    SaveCoordinator.initializeDefaultPath(for: entry)
+                }
+            } else {
+                SaveCoordinator.initializeDefaultPath(for: entry)
+            }
+            loadProgress = nil
+            previousTitle = entry.title
+
+            // Set articleDate from the loaded folder's date prefix (suppress rename trigger)
+            let folderName = entry.filePath?.deletingLastPathComponent().lastPathComponent ?? ""
+            let dateFmt = DateFormatter()
+            dateFmt.dateFormat = "yyyy-MM-dd"
+            if folderName.count >= 10, let d = dateFmt.date(from: String(folderName.prefix(10))) {
+                isLoadingArticle = true
+                articleDate = d
+                await Task.yield()   // let the onChange fire while flag is still set
+                isLoadingArticle = false
+            }
+
+            // Populate the article sidebar
+            articleManager.refresh()
+        }
+        .onDisappear {
+            // Clean up timer
+            autoSaveTimer?.invalidate()
+            autoSaveTimer = nil
+        }
+        .alert("Update URL?", isPresented: $showUrlUpdateAlert) {
+            Button("Update URL") { performFolderRenameAndMoveGCS() }
+            Button("Keep as-is", role: .cancel) { }
+        } message: {
+            Text("Rename folder to '\(pendingFolderName)'? Existing links to this article may break.")
+        }
+        .alert("Save Error", isPresented: $showSaveError) {
+            Button("OK") {
+                showSaveError = false
+            }
+        } message: {
+            Text(saveErrorMessage)
+        }
+        .alert("Publish Failed", isPresented: Binding(
+            get: { if case .failure = publishState { return true } else { return false } },
+            set: { if !$0 { publishState = .idle } }
+        )) {
+            Button("OK") { publishState = .idle }
+        } message: {
+            if case .failure(let msg) = publishState { Text(msg) }
+        }
+        .alert("Index Generation Failed", isPresented: $showRegenerateIndexError) {
+            Button("OK") { showRegenerateIndexError = false }
+        } message: {
+            Text(regenerateIndexErrorMessage)
+        }
+        .onChange(of: entry.isDirty) { _, isDirty in
+            if isDirty, case .success = publishState {
+                publishState = .idle
+            }
+        }
     }
 
     private func handleDrop(providers: [NSItemProvider]) {
@@ -111,20 +605,484 @@ struct ContentView: View {
         // Keep for backwards compatibility but shouldn't be called
     }
 
-    private func exportHTML() {
-        let panel = NSSavePanel()
-        panel.nameFieldStringValue = "\(entry.title.isEmpty ? "untitled" : entry.title).html"
-        panel.allowedContentTypes = [.html]
+    private func importImages(urls: [URL], at dropIndex: Int, cursorPosition: Int?) {
+        guard let filePath = entry.filePath else { return }
+        let baseURL = filePath.deletingLastPathComponent()
 
-        if panel.runModal() == .OK, let url = panel.url {
-            // TODO: Generate and save HTML
-            print("Would save to: \(url)")
+        try? FileManager.default.createBlogDirectoryStructure(at: baseURL)
+
+        undoCoordinator.commitTypingIfNeeded(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+        undoCoordinator.takeSnapshot(entry: entry, actionName: "Import Images", focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+
+        importProgress = (0, urls.count)
+
+        importTask = Task {
+            defer { Task { @MainActor in importProgress = nil; importTask = nil } }
+
+            var processed: [ImageItem] = []
+
+            for (i, url) in urls.enumerated() {
+                if Task.isCancelled { break }
+
+                let filename = url.lastPathComponent
+                let fullDir = baseURL.appendingPathComponent("full")
+                let tempURL = fullDir.appendingPathComponent(".tmp_\(UUID().uuidString)_\(filename)")
+
+                do {
+                    // Copy raw bytes to avoid re-encoding — preserves original quality
+                    let data = try Data(contentsOf: url)
+                    try data.write(to: tempURL)
+
+                    if Task.isCancelled {
+                        try? FileManager.default.removeItem(at: tempURL)
+                        break
+                    }
+
+                    // Atomic rename to final location
+                    let finalURL = fullDir.appendingPathComponent(filename)
+                    if FileManager.default.fileExists(atPath: finalURL.path) {
+                        try FileManager.default.removeItem(at: finalURL)
+                    }
+                    try FileManager.default.moveItem(at: tempURL, to: finalURL)
+
+                    // Save 640px small/ JPEG via ImageIO (handles HEIC, JPG, etc. reliably)
+                    try FileManager.default.saveSmallImage(at: finalURL, filename: filename, to: baseURL)
+
+                    // Resize for in-memory display — full-res NSImage released when this scope exits
+                    guard let fullImage = NSImage(contentsOf: finalURL),
+                          let resized = ImageItem.resize(image: fullImage, maxDimension: 640) else {
+                        continue
+                    }
+                    // Generate 1600px web/ JPEG for browser-compatible lightbox display
+                    try? FileManager.default.saveWebImage(at: finalURL, filename: filename, to: baseURL)
+                    var imageItem = ImageItem(resizedImage: resized, filename: filename)
+                    imageItem.caption = FileManager.readCaption(at: finalURL)
+                    processed.append(imageItem)
+
+                } catch {
+                    try? FileManager.default.removeItem(at: tempURL)
+                    print("Import failed for \(filename): \(error)")
+                }
+
+                let count = i + 1
+                await MainActor.run { importProgress = (count, urls.count) }
+            }
+
+            if !processed.isEmpty {
+                await MainActor.run {
+                    entry.insertImages(processed, at: dropIndex, cursorPosition: cursorPosition)
+                    // Always clear selection after import so KeyHandlingView doesn't steal focus
+                    selectedItemId = nil
+                    selectedItemIds.removeAll()
+                    // Focus the text item after the last inserted image
+                    let newFocusIndex = dropIndex + (processed.count * 2)
+                    if newFocusIndex < entry.items.count,
+                       case .text(let textItem) = entry.items[newFocusIndex] {
+                        focusedTextItemId = textItem.id
+                    }
+                    undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+                }
+            }
         }
     }
 
-    private func sendEmail() {
-        // TODO: Open Mail with populated message
-        print("Would open Mail")
+    private func previewEntry() {
+        saveEntry(isManualSave: false)
+        guard let filePath = entry.filePath else { return }
+        NSWorkspace.shared.open(filePath)
+    }
+
+    private func publishToTravelBlog(date: Date) async {
+        saveEntry(isManualSave: false)
+        publishState = .publishing
+        do {
+            let publishedURL = try TravelBlogPublisher.publish(entry: entry, date: date, domain: gcsBucket.isEmpty ? nil : gcsBucket)
+            // Update entry path if the article was moved (draft → TravelBlog)
+            if entry.filePath?.path != publishedURL.path {
+                let oldBase = entry.filePath?.deletingLastPathComponent()
+                entry.filePath = publishedURL
+                // Remap in-memory smallURLs (including clipboard) to the new folder location
+                if let old = oldBase, let newBase = entry.filePath?.deletingLastPathComponent() {
+                    remapImageSmallURLs(from: old, to: newBase)
+                }
+                entry.isDirty = false
+                SaveCoordinator.saveLastFilePath(publishedURL)
+            }
+            articleManager.refresh()
+            // Sync to GCS if a bucket is configured
+            if !gcsBucket.isEmpty {
+                let articleDir = publishedURL.deletingLastPathComponent()
+                try await TravelBlogPublisher.syncArticle(folderURL: articleDir, bucketName: gcsBucket)
+            }
+            publishState = .success(publishedURL)
+        } catch {
+            publishState = .failure(error.localizedDescription)
+        }
+    }
+
+    /// Called when the article is already in TravelBlog/: regenerates local files
+    /// then pushes just this article folder (plus root index.html and util/) to GCS.
+    private func updateToGCS() async {
+        guard !gcsBucket.isEmpty else { return }
+        saveEntry(isManualSave: false)
+        publishState = .publishing
+        do {
+            // Regenerate web/ images and rebuild root index.html
+            let publishedURL = try TravelBlogPublisher.publish(entry: entry, date: Date(), domain: gcsBucket.isEmpty ? nil : gcsBucket)
+            // Sync the article folder (rsync skips unchanged files; new images are included)
+            guard let filePath = entry.filePath else {
+                publishState = .failure("Lost file path after publish")
+                return
+            }
+            let articleDir = filePath.deletingLastPathComponent()
+            try await TravelBlogPublisher.syncArticle(folderURL: articleDir, bucketName: gcsBucket)
+            publishState = .success(publishedURL)
+        } catch {
+            publishState = .failure(error.localizedDescription)
+        }
+    }
+
+    // MARK: - Find
+
+    private func openFind() {
+        // If there's a text selection in the focused text view, pre-fill query with it
+        if let textView = focusedTextView {
+            let sel = textView.selectedRange()
+            if sel.length > 0, let str = textView.textStorage?.mutableString {
+                let selectedText = str.substring(with: sel)
+                if !selectedText.isEmpty {
+                    findQuery = selectedText
+                }
+            }
+        }
+        showFindBar = true
+        findFocusToken += 1   // always re-focus the search field, even if bar was already open
+        computeFindMatches()
+    }
+
+    private func closeFindBar() {
+        showFindBar = false
+        findQuery = ""
+        findMatches = []
+        currentMatchIndex = -1
+        findScrollTargetId = nil
+    }
+
+    private func computeFindMatches() {
+        guard !findQuery.isEmpty else {
+            findMatches = []
+            currentMatchIndex = -1
+            return
+        }
+        var results: [(itemId: UUID, range: NSRange, isCaption: Bool)] = []
+
+        func searchString(_ str: NSString, itemId: UUID, isCaption: Bool) {
+            var searchRange = NSRange(location: 0, length: str.length)
+            while searchRange.length > 0 {
+                let range = str.range(of: findQuery,
+                                      options: [.caseInsensitive, .diacriticInsensitive],
+                                      range: searchRange)
+                if range.location == NSNotFound { break }
+                results.append((itemId: itemId, range: range, isCaption: isCaption))
+                let next = range.location + range.length
+                searchRange = NSRange(location: next, length: str.length - next)
+            }
+        }
+
+        for item in entry.items {
+            switch item {
+            case .text(let textItem):
+                searchString(textItem.attributedContent.string as NSString,
+                             itemId: textItem.id, isCaption: false)
+            case .image(let imageItem):
+                if let caption = imageItem.caption, !caption.isEmpty {
+                    searchString(caption as NSString, itemId: imageItem.id, isCaption: true)
+                }
+            case .video:
+                break
+            }
+        }
+        findMatches = results
+        if results.isEmpty {
+            currentMatchIndex = -1
+        } else {
+            currentMatchIndex = 0
+            applyFindMatch(at: 0)
+        }
+    }
+
+    private func applyFindMatch(at index: Int) {
+        guard index >= 0, index < findMatches.count else { return }
+        let match = findMatches[index]
+        if match.isCaption {
+            // Open the caption editor so the match is visible, then scroll to the image
+            captionEditingId = match.itemId
+        } else if let textView = findRegistry.textViews[match.itemId] {
+            let len = textView.textStorage?.length ?? 0
+            let loc = min(match.range.location, len)
+            let length = min(match.range.length, max(0, len - loc))
+            if length > 0 {
+                let clampedRange = NSRange(location: loc, length: length)
+                textView.setSelectedRange(clampedRange)
+                textView.showFindIndicator(for: clampedRange)
+            }
+        }
+        findScrollTargetId = match.itemId
+    }
+
+    private func findNext() {
+        if !showFindBar { showFindBar = true; computeFindMatches(); return }
+        guard !findMatches.isEmpty else { return }
+        currentMatchIndex = (currentMatchIndex + 1) % findMatches.count
+        applyFindMatch(at: currentMatchIndex)
+    }
+
+    private func findPrevious() {
+        if !showFindBar { showFindBar = true; computeFindMatches(); return }
+        guard !findMatches.isEmpty else { return }
+        currentMatchIndex = (currentMatchIndex - 1 + findMatches.count) % findMatches.count
+        applyFindMatch(at: currentMatchIndex)
+    }
+
+    private func syncToGCSSync() {
+        Task { await syncToGCS() }
+    }
+
+    private func syncToGCS() async {
+        guard !gcsBucket.isEmpty else { return }
+        isSyncing = true
+
+        // Phase 1: generate missing small/ and web/ images for every published article.
+        // Runs on a background thread; progress shown via LoadProgressOverlay.
+        let dirs = TravelBlogPublisher.articleDirectories
+        if !dirs.isEmpty {
+            loadProgress = (0, dirs.count)
+            for (i, dir) in dirs.enumerated() {
+                await Task.detached(priority: .userInitiated) {
+                    TravelBlogPublisher.generateMissingSmallImages(in: dir)
+                    try? TravelBlogPublisher.generateMissingWebImages(in: dir)
+                }.value
+                loadProgress = (i + 1, dirs.count)
+            }
+            loadProgress = nil
+        }
+
+        // Phase 2: regenerate index.html and util/ so rsync doesn't delete them.
+        // (--delete-unmatched-destination-objects would remove any GCS file missing locally.)
+        try? TravelBlogPublisher.regenerateIndex(domain: gcsBucket.isEmpty ? nil : gcsBucket)
+        try? TravelBlogPublisher.ensureUtilFiles()
+
+        // Phase 3: rsync everything to GCS.
+        syncProgressCompleted = 0
+        syncProgressTotal = nil
+        syncProgressFiles = []
+        showSyncProgress = true
+
+        do {
+            try await TravelBlogPublisher.sync(bucketName: gcsBucket) { update in
+                self.syncProgressCompleted = update.completed
+                self.syncProgressTotal = update.total
+                if let file = update.lastFile {
+                    self.syncProgressFiles.append(file)
+                    // Cap the list so memory stays bounded on a huge first sync
+                    if self.syncProgressFiles.count > 500 {
+                        self.syncProgressFiles.removeFirst()
+                    }
+                }
+            }
+        } catch {
+            syncErrorMessage = error.localizedDescription
+            showSyncError = true
+        }
+
+        showSyncProgress = false
+        isSyncing = false
+    }
+
+    private func regenerateIndex() {
+        Task {
+            // Repair missing small/ and web/ images for every article (Drafts + TravelBlog).
+            let dirs = articleManager.articles.map { $0.folderURL }
+            if !dirs.isEmpty {
+                loadProgress = (0, dirs.count)
+                for (i, dir) in dirs.enumerated() {
+                    let d = dir
+                    await Task.detached(priority: .userInitiated) {
+                        TravelBlogPublisher.generateMissingSmallImages(in: d)
+                        try? TravelBlogPublisher.generateMissingWebImages(in: d)
+                    }.value
+                    loadProgress = (i + 1, dirs.count)
+                }
+                loadProgress = nil
+            }
+            do {
+                try TravelBlogPublisher.regenerateIndex(domain: gcsBucket.isEmpty ? nil : gcsBucket)
+                articleManager.refresh()
+            } catch {
+                regenerateIndexErrorMessage = error.localizedDescription
+                showRegenerateIndexError = true
+            }
+        }
+    }
+
+    /// Returns the desired folder name derived from the current articleDate + title slug.
+    private func computeDesiredFolderName() -> String {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd"
+        let dateStr = fmt.string(from: articleDate)
+        let slug = ArticleManager.slugify(entry.title)
+        return slug.isEmpty ? dateStr : "\(dateStr)_\(slug)"
+    }
+
+    /// Triggers a folder rename if the desired name differs from the current one.
+    /// For unpublished articles, renames immediately. For published, shows an alert.
+    private func triggerFolderRename() {
+        guard !isLoadingArticle else { return }
+        let desired = computeDesiredFolderName()
+        guard desired != currentFolderName else { return }
+
+        if isPublished {
+            pendingFolderName = desired
+            pendingOldGCSFolder = currentFolderName
+            showUrlUpdateAlert = true
+        } else {
+            performFolderRename(newFolderName: desired)
+        }
+    }
+
+    /// Renames the local folder to `newFolderName`.
+    private func performFolderRename(newFolderName: String) {
+        let oldBase = entry.filePath?.deletingLastPathComponent()
+        do {
+            try SaveCoordinator.updatePath(for: entry, newFolderName: newFolderName)
+            if let old = oldBase, let newBase = entry.filePath?.deletingLastPathComponent(), old != newBase {
+                remapImageSmallURLs(from: old, to: newBase)
+            }
+            saveEntry(isManualSave: false)
+            articleManager.refresh()
+        } catch {
+            saveErrorMessage = error.localizedDescription
+            showSaveError = true
+        }
+    }
+
+    /// Renames the local folder and moves GCS objects to match (for published articles).
+    private func performFolderRenameAndMoveGCS() {
+        let oldFolder = pendingOldGCSFolder
+        let newFolderName = pendingFolderName
+        let oldBase = entry.filePath?.deletingLastPathComponent()
+
+        do {
+            try SaveCoordinator.updatePath(for: entry, newFolderName: newFolderName)
+            if let old = oldBase, let newBase = entry.filePath?.deletingLastPathComponent(), old != newBase {
+                remapImageSmallURLs(from: old, to: newBase)
+            }
+            saveEntry(isManualSave: false)
+            articleManager.refresh()
+        } catch {
+            saveErrorMessage = error.localizedDescription
+            showSaveError = true
+            return
+        }
+
+        guard !gcsBucket.isEmpty else { return }
+        let bucket = gcsBucket
+        Task {
+            do {
+                try await TravelBlogPublisher.moveGCSFolder(
+                    oldFolder: oldFolder, newFolder: newFolderName, bucketName: bucket)
+            } catch {
+                await MainActor.run {
+                    saveErrorMessage = "Folder renamed locally, but GCS move failed: \(error.localizedDescription)"
+                    showSaveError = true
+                }
+            }
+        }
+    }
+
+    /// After a folder rename, repoints all imageItem.smallURL values (in entry.items, clipboard,
+    /// and undo/redo snapshots) to the new folder so lazy-load and undo still work.
+    private func remapImageSmallURLs(from oldBase: URL, to newBase: URL) {
+        let oldPrefix = oldBase.path + "/"
+        for i in entry.items.indices {
+            if case .image(var imageItem) = entry.items[i],
+               let url = imageItem.smallURL,
+               url.path.hasPrefix(oldPrefix) {
+                let relative = String(url.path.dropFirst(oldPrefix.count))
+                imageItem.smallURL = newBase.appendingPathComponent(relative)
+                entry.items[i] = .image(imageItem)
+            }
+        }
+        clipboard = clipboard.map { item in
+            guard case .image(var imageItem) = item,
+                  let url = imageItem.smallURL,
+                  url.path.hasPrefix(oldPrefix) else { return item }
+            let relative = String(url.path.dropFirst(oldPrefix.count))
+            imageItem.smallURL = newBase.appendingPathComponent(relative)
+            return .image(imageItem)
+        }
+        undoCoordinator.remapSmallURLs(from: oldBase, to: newBase)
+    }
+
+    // MARK: - Image backfill
+
+    /// Generates web/ (1600px JPEG) for any image in full/ referenced by the entry
+    /// that doesn't already have a web/ version. Runs encoding off the main thread.
+    private func generateMissingWebImages(baseURL: URL) async {
+        let fullDir = baseURL.appendingPathComponent("full")
+        let webDir  = baseURL.appendingPathComponent("web")
+
+        let needed: [(filename: String, sourceURL: URL)] = entry.items.compactMap { item in
+            guard case .image(let img) = item else { return nil }
+            let base = (img.filename as NSString).deletingPathExtension
+            let webFile = webDir.appendingPathComponent("\(base).jpg")
+            guard !FileManager.default.fileExists(atPath: webFile.path) else { return nil }
+            let src = fullDir.appendingPathComponent(img.filename)
+            guard FileManager.default.fileExists(atPath: src.path) else { return nil }
+            return (img.filename, src)
+        }
+        guard !needed.isEmpty else { return }
+
+        loadProgress = (0, needed.count)
+        for (done, (filename, sourceURL)) in needed.enumerated() {
+            // Encode on a background thread so the UI stays responsive
+            let b = baseURL, f = filename, s = sourceURL
+            await Task.detached(priority: .userInitiated) {
+                try? FileManager.default.saveWebImage(at: s, filename: f, to: b)
+            }.value
+            loadProgress = (done + 1, needed.count)
+        }
+    }
+
+    // MARK: - Save functionality
+
+    /// True when the currently loaded article lives in TravelBlog/ (already published).
+    private var isPublished: Bool {
+        guard let filePath = entry.filePath else { return false }
+        let articleDir = filePath.deletingLastPathComponent()
+        return articleDir.deletingLastPathComponent().standardized.path
+            == TravelBlogPublisher.travelBlogDir.standardized.path
+    }
+
+    private var currentFolderName: String {
+        guard let filePath = entry.filePath else {
+            return "untitled"
+        }
+        return filePath.deletingLastPathComponent().lastPathComponent
+    }
+
+    private func saveEntry(isManualSave: Bool) {
+        do {
+            try SaveCoordinator.save(entry: entry, isManualSave: isManualSave, domain: gcsBucket.isEmpty ? nil : gcsBucket)
+
+            if isManualSave {
+                print("Entry saved successfully")
+            }
+        } catch {
+            saveErrorMessage = error.localizedDescription
+            showSaveError = true
+            print("Save failed: \(error)")
+        }
     }
 
     private func canCut() -> Bool {
@@ -132,10 +1090,17 @@ struct ContentView: View {
     }
 
     private func canPaste() -> Bool {
-        return !clipboard.isEmpty
+        guard !clipboard.isEmpty else { return false }
+        // If the system pasteboard changed after our cut (user did native copy/cut),
+        // let NSTextView handle Cmd-V natively instead of using our internal clipboard.
+        guard NSPasteboard.general.changeCount == clipboardPasteboardCount else { return false }
+        return focusedTextItemId != nil || selectedItemId != nil
     }
 
     private func handleCut() {
+        undoCoordinator.commitTypingIfNeeded(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+        undoCoordinator.takeSnapshot(entry: entry, actionName: "Cut", focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+
         let itemsToCut: [UUID]
 
         if !selectedItemIds.isEmpty {
@@ -161,28 +1126,36 @@ struct ContentView: View {
 
         // Store items in clipboard
         clipboard = indicesToCut.map { entry.items[$0] }
+        clipboardPasteboardCount = NSPasteboard.general.changeCount
 
         // Find text items before first and after last cut item
         let firstIndex = indicesToCut.first!
         let lastIndex = indicesToCut.last!
 
-        var textBefore = ""
-        var textAfter = ""
+        var attrBefore: NSAttributedString? = nil
+        var attrAfter: NSAttributedString? = nil
 
         if firstIndex > 0, case .text(let beforeItem) = entry.items[firstIndex - 1] {
-            textBefore = beforeItem.content
+            if beforeItem.attributedContent.length > 0 { attrBefore = beforeItem.attributedContent }
         }
 
         if lastIndex < entry.items.count - 1, case .text(let afterItem) = entry.items[lastIndex + 1] {
-            textAfter = afterItem.content
+            if afterItem.attributedContent.length > 0 { attrAfter = afterItem.attributedContent }
         }
 
-        // Combine text
-        let combined = if !textBefore.isEmpty && !textAfter.isEmpty {
-            textBefore + "\n\n" + textAfter
-        } else {
-            textBefore + textAfter
-        }
+        // Combine attributed strings, preserving all formatting (headings, bold, etc.)
+        let combinedAttr: NSAttributedString = {
+            switch (attrBefore, attrAfter) {
+            case (let b?, let a?):
+                let m = NSMutableAttributedString(attributedString: b)
+                m.append(NSAttributedString(string: "\n\n"))
+                m.append(a)
+                return m
+            case (let b?, nil): return b
+            case (nil, let a?): return a
+            case (nil, nil):    return NSAttributedString()
+            }
+        }()
 
         // Remove cut items and adjacent text items
         var toRemove = indicesToCut
@@ -198,29 +1171,43 @@ struct ContentView: View {
             entry.items.remove(at: index)
         }
 
-        // Insert combined text
+        // Insert combined text item, preserving attributed formatting
         let insertIndex = toRemove.min()!
-        entry.addText(combined, at: insertIndex)
+        entry.items.insert(.text(TextItem(attributedContent: combinedAttr)), at: insertIndex)
 
         // Clear selection
         selectedItemId = nil
         selectedItemIds.removeAll()
+
+        undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
     }
 
-    private func handlePaste() {
-        guard !clipboard.isEmpty else { return }
+    @discardableResult
+    private func handlePaste() -> Bool {
+        guard !clipboard.isEmpty else { return false }
+        guard NSPasteboard.general.changeCount == clipboardPasteboardCount else { return false }
+
+        undoCoordinator.commitTypingIfNeeded(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+        undoCoordinator.takeSnapshot(entry: entry, actionName: "Paste", focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
 
         // Determine where to paste
         if let focusedId = focusedTextItemId,
            let focusedIndex = entry.items.firstIndex(where: { $0.id == focusedId }),
            case .text(let textItem) = entry.items[focusedIndex] {
             // Paste into text area at cursor position
+            selectedItemId = nil
+            selectedItemIds.removeAll()
             pasteIntoText(at: focusedIndex, textItem: textItem)
         } else if let selectedId = selectedItemId,
                   let selectedIndex = entry.items.firstIndex(where: { $0.id == selectedId }) {
-            // Paste before selected image
-            pasteBeforeItem(at: selectedIndex)
+            // Paste after selected image (matching drag-and-drop behavior), then clear selection
+            selectedItemId = nil
+            selectedItemIds.removeAll()
+            pasteBeforeItem(at: selectedIndex + 1)
         }
+
+        undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+        return true
     }
 
     private func pasteIntoText(at index: Int, textItem: TextItem) {
@@ -228,24 +1215,28 @@ struct ContentView: View {
         let cursorPos = textItem.currentCursorPosition
         let content = textItem.content
         let splitPos = min(cursorPos, content.count)
-
-        // Find end of line
-        var endOfLine = splitPos
         let contentNS = content as NSString
-        while endOfLine < content.count {
-            let char = contentNS.character(at: endOfLine)
-            if char == 0x000A {
-                endOfLine += 1
-                break
+
+        // If cursor is at the start of a line (position 0 or immediately after \n),
+        // split right there. Otherwise advance to the end of the current line,
+        // stopping BEFORE the newline character.
+        let isAtLineStart = splitPos == 0 ||
+            (splitPos > 0 && contentNS.character(at: splitPos - 1) == 0x000A)
+
+        let finalSplitPos: Int
+        if isAtLineStart {
+            finalSplitPos = splitPos
+        } else {
+            var pos = splitPos
+            while pos < content.count && contentNS.character(at: pos) != 0x000A {
+                pos += 1
             }
-            endOfLine += 1
+            finalSplitPos = pos
         }
 
-        var textBefore = String(content.prefix(endOfLine))
-        var textAfter = String(content.suffix(content.count - endOfLine))
-
-        textBefore = textBefore.replacingOccurrences(of: "\\n+$", with: "", options: .regularExpression)
-        textAfter = textAfter.replacingOccurrences(of: "^\\n+", with: "", options: .regularExpression)
+        let textBefore = String(content.prefix(finalSplitPos))
+        let textAfter = String(content.suffix(content.count - finalSplitPos))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
 
         textItem.content = textBefore
 
@@ -283,6 +1274,7 @@ struct ContentView: View {
     }
 
     private func handleImageTap(imageItem: ImageItem, index: Int, modifiers: NSEvent.ModifierFlags) {
+        captionEditingId = nil
         if modifiers.contains(.shift), let firstId = selectedItemId {
             // Shift-click: select range
             guard let firstIndex = entry.items.firstIndex(where: { $0.id == firstId }) else { return }
@@ -305,6 +1297,7 @@ struct ContentView: View {
     }
 
     private func handleVideoTap(videoItem: VideoItem, index: Int, modifiers: NSEvent.ModifierFlags) {
+        captionEditingId = nil
         if modifiers.contains(.shift), let firstId = selectedItemId {
             // Shift-click: select range
             guard let firstIndex = entry.items.firstIndex(where: { $0.id == firstId }) else { return }
@@ -327,6 +1320,9 @@ struct ContentView: View {
     }
 
     private func applyFormatting(_ formatting: FormattingType) {
+        undoCoordinator.commitTypingIfNeeded(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+        undoCoordinator.takeSnapshot(entry: entry, actionName: "\(formatting)", focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+
         guard let textView = focusedTextView else {
             print("No focused text view")
             return
@@ -341,6 +1337,7 @@ struct ContentView: View {
         case .bold:
             if savedRange.length > 0 {
                 textView.applyFontTrait(.boldFontMask, range: savedRange)
+                textView.didChangeText()  // sync model so updateNSView doesn't overwrite formatting
             } else {
                 // Toggle bold in typing attributes
                 toggleTypingAttribute(.boldFontMask, textView: textView)
@@ -349,6 +1346,7 @@ struct ContentView: View {
         case .italic:
             if savedRange.length > 0 {
                 textView.applyFontTrait(.italicFontMask, range: savedRange)
+                textView.didChangeText()  // sync model so updateNSView doesn't overwrite formatting
             } else {
                 // Toggle italic in typing attributes
                 toggleTypingAttribute(.italicFontMask, textView: textView)
@@ -364,6 +1362,7 @@ struct ContentView: View {
                     // Add underline
                     textStorage.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: savedRange)
                 }
+                textView.didChangeText()  // sync model so updateNSView doesn't overwrite formatting
             } else {
                 // Toggle underline in typing attributes
                 var attrs = textView.typingAttributes
@@ -383,20 +1382,28 @@ struct ContentView: View {
             applyHeading(textView: textView, savedRange: savedRange, level: 3)
         case .bulletList:
             applyListStyle(textView: textView, savedRange: savedRange, ordered: false)
+            undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
             return  // Don't restore selection - applyListStyle handles it
         case .numberedList:
             applyListStyle(textView: textView, savedRange: savedRange, ordered: true)
+            undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
             return  // Don't restore selection - applyListStyle handles it
         }
+
+        undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
 
         // Restore focus and selection
         DispatchQueue.main.async {
             textView.window?.makeFirstResponder(textView)
-            // Make sure the saved range is still valid after potential text changes
-            let validLocation = min(savedRange.location, textStorage.length)
-            let validLength = min(savedRange.length, textStorage.length - validLocation)
-            let validRange = NSRange(location: validLocation, length: validLength)
-            textView.setSelectedRange(validRange)
+            // Only restore an explicit selection — with no selection (cursor only),
+            // calling setSelectedRange triggers textViewDidChangeSelection which
+            // re-syncs typingAttributes from textStorage, wiping the typing-mode toggle.
+            if savedRange.length > 0 {
+                let validLocation = min(savedRange.location, textStorage.length)
+                let validLength = min(savedRange.length, textStorage.length - validLocation)
+                let validRange = NSRange(location: validLocation, length: validLength)
+                textView.setSelectedRange(validRange)
+            }
         }
     }
 
@@ -405,10 +1412,10 @@ struct ContentView: View {
 
         // If text is completely empty, we can't apply formatting - just set typing attributes
         if textStorage.length == 0 {
-            let baseSize: CGFloat = 14
-            let headingSizes: [Int: CGFloat] = [1: 24, 2: 20, 3: 16]
+            let baseSize: CGFloat = kBodyFontSize
+            let headingSizes: [Int: CGFloat] = kHeadingSizes
             let targetFontSize = headingSizes[level] ?? baseSize
-            let font = NSFont.boldSystemFont(ofSize: targetFontSize)
+            let font = headingFont(targetFontSize)
             textView.typingAttributes = [.font: font]
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 self.updateActiveFormats()
@@ -424,8 +1431,8 @@ struct ContentView: View {
         // Check if this heading level is already applied
         let checkLocation = min(paragraphRange.location, max(0, textStorage.length - 1))
         let currentFont = textStorage.attribute(.font, at: checkLocation, effectiveRange: nil) as? NSFont
-        let baseSize: CGFloat = 14
-        let headingSizes: [Int: CGFloat] = [1: 24, 2: 20, 3: 16]
+        let baseSize: CGFloat = kBodyFontSize
+        let headingSizes: [Int: CGFloat] = kHeadingSizes
         let targetFontSize = headingSizes[level] ?? baseSize
 
         var isAlreadyThisHeading = false
@@ -438,12 +1445,15 @@ struct ContentView: View {
             // Remove heading - revert to normal text
             let font = NSFont.systemFont(ofSize: baseSize)
             textStorage.addAttribute(.font, value: font, range: paragraphRange)
-            textView.typingAttributes = [.font: font]
+            textStorage.addAttribute(.paragraphStyle, value: NSParagraphStyle.default, range: paragraphRange)
+            textView.typingAttributes = [.font: font, .paragraphStyle: NSParagraphStyle.default]
         } else {
             // Apply heading
-            let font = NSFont.boldSystemFont(ofSize: targetFontSize)
+            let font = headingFont(targetFontSize)
+            let style = NSMutableParagraphStyle(); style.paragraphSpacing = 14
             textStorage.addAttribute(.font, value: font, range: paragraphRange)
-            textView.typingAttributes = [.font: font]
+            textStorage.addAttribute(.paragraphStyle, value: style, range: paragraphRange)
+            textView.typingAttributes = [.font: font, .paragraphStyle: style]
         }
 
         textStorage.endEditing()
@@ -506,7 +1516,7 @@ struct ContentView: View {
             }
             // Ensure we have a font
             if attrs[.font] == nil {
-                attrs[.font] = NSFont.systemFont(ofSize: 14)
+                attrs[.font] = bodyFont()
             }
 
             let markerAttr = NSAttributedString(string: marker, attributes: attrs)
@@ -540,7 +1550,7 @@ struct ContentView: View {
         var attrs = textView.typingAttributes
 
         // Get current font or use default
-        let currentFont = attrs[.font] as? NSFont ?? NSFont.systemFont(ofSize: 14)
+        let currentFont = attrs[.font] as? NSFont ?? bodyFont()
         let fontManager = NSFontManager.shared
 
         // Check if trait is currently set
@@ -561,26 +1571,30 @@ struct ContentView: View {
 
     private func updateActiveFormats() {
         guard let textView = focusedTextView else {
-            activeFormats = []
+            if !activeFormats.isEmpty { activeFormats = [] }
             return
         }
 
         guard let textStorage = textView.textStorage else {
-            activeFormats = []
+            if !activeFormats.isEmpty { activeFormats = [] }
             return
         }
 
         let selectedRange = textView.selectedRange()
         var formats: Set<FormattingType> = []
 
-        // If there's no text or cursor is at/past end, check typing attributes
+        // If there's no selection (cursor only), check typing attributes
+        // If there's a selection, check the attributes of the selected text
         let attrs: [NSAttributedString.Key: Any]
-        if textStorage.length == 0 || selectedRange.location >= textStorage.length {
+        if selectedRange.length == 0 {
+            // No selection - check typing attributes for what WILL be typed
+            attrs = textView.typingAttributes
+        } else if textStorage.length == 0 || selectedRange.location >= textStorage.length {
+            // Edge case: no text or past end
             attrs = textView.typingAttributes
         } else {
-            // Check font attributes at cursor position
-            let location = selectedRange.location > 0 ? selectedRange.location - 1 : 0
-            attrs = textStorage.attributes(at: location, effectiveRange: nil)
+            // Selection exists - check attributes at selection start
+            attrs = textStorage.attributes(at: selectedRange.location, effectiveRange: nil)
         }
 
         // Check for bold, italic
@@ -589,11 +1603,11 @@ struct ContentView: View {
             if traits.contains(.boldFontMask) {
                 // Check if it's a heading by font size
                 let fontSize = font.pointSize
-                if fontSize >= 24 {
+                if fontSize >= kHeadingSizes[1]! {
                     formats.insert(.heading1)
-                } else if fontSize >= 20 {
+                } else if fontSize >= kHeadingSizes[2]! {
                     formats.insert(.heading2)
-                } else if fontSize >= 16 {
+                } else if fontSize >= kHeadingSizes[3]! {
                     formats.insert(.heading3)
                 } else {
                     formats.insert(.bold)
@@ -609,8 +1623,9 @@ struct ContentView: View {
             formats.insert(.underline)
         }
 
-        // Check for list markers (with optional even indentation) - only if there's text
-        if textStorage.length > 0 {
+        // Check for list markers — only if NOT in a heading paragraph
+        let isHeading = formats.contains(.heading1) || formats.contains(.heading2) || formats.contains(.heading3)
+        if !isHeading && textStorage.length > 0 {
             let paragraphRange = (textStorage.string as NSString).paragraphRange(for: selectedRange)
             let paragraphText = (textStorage.string as NSString).substring(with: paragraphRange)
 
@@ -629,7 +1644,10 @@ struct ContentView: View {
             }
         }
 
-        activeFormats = formats
+        // Only update (and trigger a re-render) when formatting actually changed
+        if formats != activeFormats {
+            activeFormats = formats
+        }
     }
 
     private func navigateUp(from index: Int) {
@@ -679,8 +1697,25 @@ struct ContentView: View {
         }
     }
 
+    private func handleEnterKey() {
+        guard let selectedId = selectedItemId,
+              let index = entry.items.firstIndex(where: { $0.id == selectedId }),
+              case .image = entry.items[index] else { return }
+        captionEditingId = selectedId
+    }
+
+    private func updateImageCaption(id: UUID, caption: String?) {
+        guard let index = entry.items.firstIndex(where: { $0.id == id }),
+              case .image(var imageItem) = entry.items[index] else { return }
+        imageItem.caption = caption
+        entry.items[index] = .image(imageItem)
+    }
+
     private func handleDelete() {
         guard let selectedId = selectedItemId else { return }
+
+        undoCoordinator.commitTypingIfNeeded(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+        undoCoordinator.takeSnapshot(entry: entry, actionName: "Delete", focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
 
         // Find the selected item index
         guard let selectedIndex = entry.items.firstIndex(where: { $0.id == selectedId }) else { return }
@@ -753,7 +1788,137 @@ struct ContentView: View {
         case .text:
             break
         }
+
+        undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
     }
+
+    // MARK: - Undo / Redo
+
+    private func performUndo() {
+        if let result = undoCoordinator.undo(into: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId) {
+            applyRestoreResult(result)
+        }
+    }
+
+    private func performRedo() {
+        if let result = undoCoordinator.redo(into: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId) {
+            applyRestoreResult(result)
+        }
+    }
+
+    private func applyRestoreResult(_ result: UndoCoordinator.RestoreResult) {
+        focusedTextItemId = result.focusedTextItemId
+        selectedItemId = result.selectedItemId
+        selectedItemIds.removeAll()
+        previousTitle = entry.title
+    }
+
+    // MARK: - Article management
+
+    private func loadArticle(_ article: ArticleEntry) {
+        let currentFolder = entry.filePath?.deletingLastPathComponent()
+        if currentFolder?.path == article.folderURL.path { return }
+
+        if entry.isDirty { saveEntry(isManualSave: false) }
+        closeFindBar()
+        undoCoordinator.clear()
+        publishState = .idle
+        selectedItemId = nil
+        selectedItemIds.removeAll()
+        captionEditingId = nil
+        focusedTextItemId = nil
+        showUrlUpdateAlert = false
+        pendingFolderName = ""
+        pendingOldGCSFolder = ""
+
+        isLoadingArticle = true   // suppress rename triggers while loading
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd"
+        articleDate = article.dateString.isEmpty ? Date() : (fmt.date(from: article.dateString) ?? Date())
+
+        // Prefer index.html; fall back to legacy <folderName>.html
+        let loadURL: URL
+        if FileManager.default.fileExists(atPath: article.htmlURL.path) {
+            loadURL = article.htmlURL
+        } else {
+            let legacyName = article.folderURL.lastPathComponent
+            let legacyURL = article.folderURL.appendingPathComponent("\(legacyName).html")
+            guard FileManager.default.fileExists(atPath: legacyURL.path) else { return }
+            loadURL = legacyURL
+        }
+
+        Task {
+            defer { isLoadingArticle = false }
+            do {
+                // Backfill missing small/ JPEGs before populating entry so ImageItemViews
+                // always find the files ready on their first onAppear.
+                let loadFolder = loadURL.deletingLastPathComponent()
+                await Task.detached(priority: .userInitiated) {
+                    TravelBlogPublisher.generateMissingSmallImages(in: loadFolder)
+                }.value
+                try await HTMLParser.load(from: loadURL, into: entry)
+                previousTitle = entry.title
+                SaveCoordinator.saveLastFilePath(entry.filePath ?? loadURL)
+                await generateMissingWebImages(baseURL: loadURL.deletingLastPathComponent())
+            } catch {
+                print("Failed to load article: \(error)")
+            }
+            loadProgress = nil
+        }
+    }
+
+    private func createNewArticle() {
+        if entry.isDirty { saveEntry(isManualSave: false) }
+
+        isLoadingArticle = true   // suppress rename while we set up the new entry
+        articleDate = Date()
+
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd"
+        let today = fmt.string(from: Date())
+
+        let draftsDir = ArticleManager.draftsDir
+        var folderName = "\(today)_untitled"
+        var counter = 1
+        while FileManager.default.fileExists(
+            atPath: draftsDir.appendingPathComponent(folderName).path
+        ) {
+            folderName = "\(today)_untitled-\(counter)"
+            counter += 1
+        }
+
+        let newFolderURL = draftsDir.appendingPathComponent(folderName)
+        let newHTMLURL = newFolderURL.appendingPathComponent("index.html")
+
+        do {
+            try FileManager.default.createBlogDirectoryStructure(at: newFolderURL)
+
+            // Reset entry without triggering change tracking
+            entry.suspendChangeTracking()
+            entry.title = ""
+            entry.items = [.text(TextItem())]
+            entry.filePath = newHTMLURL
+            entry.isDirty = false
+            entry.resumeChangeTracking()
+
+            undoCoordinator.clear()
+            publishState = .idle
+            previousTitle = ""
+            focusedTextItemId = nil
+            selectedItemId = nil
+
+            let html = HTMLConverter.convert(entry: entry, imageMap: [:])
+            try FileManager.default.atomicSave(content: html, to: newHTMLURL)
+            SaveCoordinator.saveLastFilePath(newHTMLURL)
+
+            articleManager.refresh()
+        } catch {
+            print("Failed to create new article: \(error)")
+        }
+        // Defer the flag reset so the onChange for articleDate fires while it is still set
+        DispatchQueue.main.async { self.isLoadingArticle = false }
+    }
+
 }
 
 enum FormattingType: Hashable {
@@ -769,10 +1934,14 @@ struct TextItemView: View {
     let onNavigateUp: () -> Void
     let onNavigateDown: () -> Void
     let onFocusChanged: (Bool) -> Void
-    let onImageDrop: ([(NSImage, String)]) -> Void
-    let onPaste: () -> Void
+    let onImageDrop: ([URL]) -> Void
+    let onPaste: () -> Bool
     let onTextViewFocusChanged: (CustomNSTextView?) -> Void
     let onSelectionChanged: () -> Void
+    let onTextDidChange: () -> Void
+    var onUndo: (() -> Void)?
+    var onRedo: (() -> Void)?
+    var onEscapeKey: (() -> Void)?
 
     var body: some View {
         // Padding above and below depends on whether text is empty
@@ -792,7 +1961,11 @@ struct TextItemView: View {
                 onImageDrop: onImageDrop,
                 onPaste: onPaste,
                 onTextViewFocusChanged: onTextViewFocusChanged,
-                onSelectionChanged: onSelectionChanged
+                onSelectionChanged: onSelectionChanged,
+                onTextDidChange: onTextDidChange,
+                onUndo: onUndo,
+                onRedo: onRedo,
+                onEscapeKey: onEscapeKey
             )
             .frame(height: textHeight)
             .frame(maxWidth: .infinity)
@@ -808,16 +1981,21 @@ struct TextItemView: View {
 
 // Native NSTextView wrapper for better keyboard handling
 struct MacTextEditor: NSViewRepresentable {
+    @EnvironmentObject var findRegistry: FindRegistry
     @ObservedObject var textItem: TextItem
     @Binding var height: CGFloat
     let isFocused: Bool
     let onNavigateUp: () -> Void
     let onNavigateDown: () -> Void
     let onFocusChanged: (Bool) -> Void
-    let onImageDrop: ([(NSImage, String)]) -> Void
-    let onPaste: () -> Void
+    let onImageDrop: ([URL]) -> Void
+    let onPaste: () -> Bool
     let onTextViewFocusChanged: (CustomNSTextView?) -> Void
     let onSelectionChanged: () -> Void
+    let onTextDidChange: () -> Void
+    var onUndo: (() -> Void)?
+    var onRedo: (() -> Void)?
+    var onEscapeKey: (() -> Void)?
 
     func makeNSView(context: Context) -> CustomNSTextView {
         let textView = CustomNSTextView()
@@ -826,16 +2004,25 @@ struct MacTextEditor: NSViewRepresentable {
         textView.onPaste = onPaste
         textView.onFocusChanged = onTextViewFocusChanged
         textView.onSelectionChanged = onSelectionChanged
+        textView.onUndo = onUndo
+        textView.onRedo = onRedo
+        textView.onEscapeKey = onEscapeKey
+
+        // Register for find bar highlighting
+        context.coordinator.findRegistry = findRegistry
+        findRegistry.textViews[textItem.id] = textView
 
         textView.delegate = context.coordinator
         textView.isRichText = true  // Enable rich text
-        textView.font = NSFont.systemFont(ofSize: 14)
+        textView.font = bodyFont()
+        textView.typingAttributes = [.font: bodyFont(), .foregroundColor: NSColor.textColor]
         textView.textColor = NSColor.textColor
         textView.backgroundColor = .clear
         textView.drawsBackground = true
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
-        textView.isAutomaticSpellingCorrectionEnabled = true
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.isContinuousSpellCheckingEnabled = true
 
         // Disable undo to avoid crashes (will implement properly later)
         textView.allowsUndo = false
@@ -856,6 +2043,15 @@ struct MacTextEditor: NSViewRepresentable {
     }
 
     func updateNSView(_ textView: CustomNSTextView, context: Context) {
+        // Keep callbacks fresh so SwiftUI state changes are reflected
+        textView.onUndo = onUndo
+        textView.onRedo = onRedo
+        textView.onFocusChanged = onTextViewFocusChanged
+        textView.onSelectionChanged = onSelectionChanged
+        textView.onEscapeKey = onEscapeKey
+        context.coordinator.parent = self
+        context.coordinator.findRegistry = findRegistry
+
         // Only update attributed text if we're not currently the first responder
         // (i.e., only update when focus changes or external updates occur)
         if textView.window?.firstResponder != textView {
@@ -891,8 +2087,13 @@ struct MacTextEditor: NSViewRepresentable {
         Coordinator(self)
     }
 
+    static func dismantleNSView(_ nsView: CustomNSTextView, coordinator: Coordinator) {
+        coordinator.findRegistry?.textViews.removeValue(forKey: coordinator.parent.textItem.id)
+    }
+
     class Coordinator: NSObject, NSTextViewDelegate {
         var parent: MacTextEditor
+        weak var findRegistry: FindRegistry?
 
         init(_ parent: MacTextEditor) {
             self.parent = parent
@@ -944,17 +2145,13 @@ struct MacTextEditor: NSViewRepresentable {
                 }
             }
 
-            // Update the attributed content
+            // Notify about text change (for undo typing grouping — snapshot before model update)
+            parent.onTextDidChange()
+
+            // Update the attributed content (triggers SwiftUI re-render, which calls
+            // updateNSView where height is recalculated — no need to do it here too)
             if let attributedString = textStorage.copy() as? NSAttributedString {
                 parent.textItem.attributedContent = attributedString
-            }
-
-            // Recalculate height when text changes
-            textView.layoutManager?.ensureLayout(for: textView.textContainer!)
-            let newHeight = max(20, textView.layoutManager?.usedRect(for: textView.textContainer!).height ?? 20)
-
-            DispatchQueue.main.async {
-                self.parent.height = newHeight
             }
         }
 
@@ -970,14 +2167,42 @@ struct MacTextEditor: NSViewRepresentable {
             guard let textView = notification.object as? NSTextView else { return }
             parent.textItem.currentCursorPosition = textView.selectedRange().location
 
+            // Sync typing attributes with the text at the cursor position.
+            // applyFontTrait modifies textStorage directly (bypassing NSTextView's normal
+            // editing path), so NSTextView doesn't auto-update typingAttributes after
+            // selection-based bold/italic/underline. We do it here so the toolbar
+            // always reflects the formatting under the cursor.
+            if let textStorage = textView.textStorage, textStorage.length > 0 {
+                let sel = textView.selectedRange()
+                let checkPos: Int
+                if sel.length > 0 {
+                    checkPos = min(sel.location, textStorage.length - 1)
+                } else if sel.location > 0 {
+                    checkPos = min(sel.location - 1, textStorage.length - 1)
+                } else {
+                    checkPos = 0
+                }
+                let textAttrs = textStorage.attributes(at: checkPos, effectiveRange: nil)
+                var typingAttrs = textView.typingAttributes
+                if let font = textAttrs[.font] as? NSFont {
+                    typingAttrs[.font] = font
+                }
+                if let underline = textAttrs[.underlineStyle] {
+                    typingAttrs[.underlineStyle] = underline
+                } else {
+                    typingAttrs.removeValue(forKey: .underlineStyle)
+                }
+                textView.typingAttributes = typingAttrs
+            }
+
             // Notify about selection change
             if let customTextView = textView as? CustomNSTextView {
                 customTextView.onSelectionChanged?()
             }
         }
 
-        func handleImageDrop(_ images: [(NSImage, String)]) {
-            parent.onImageDrop(images)
+        func handleImageDrop(_ urls: [URL]) {
+            parent.onImageDrop(urls)
         }
     }
 }
@@ -1024,10 +2249,13 @@ extension NSTextView {
 // Custom NSTextView to handle arrow key navigation
 class CustomNSTextView: NSTextView {
     weak var coordinator: MacTextEditor.Coordinator?
-    var onImageDrop: ([(NSImage, String)]) -> Void = { _ in }
-    var onPaste: (() -> Void)?
+    var onImageDrop: ([URL]) -> Void = { _ in }
+    var onPaste: (() -> Bool)?
+    var onUndo: (() -> Void)?
+    var onRedo: (() -> Void)?
     var onFocusChanged: ((CustomNSTextView?) -> Void)?
     var onSelectionChanged: (() -> Void)?
+    var onEscapeKey: (() -> Void)?
     private var justBecameFirstResponder = false
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -1058,16 +2286,10 @@ class CustomNSTextView: NSTextView {
                 return false
             }
 
-            var images: [(NSImage, String)] = []
-            for url in urls {
-                if let image = NSImage(contentsOf: url) {
-                    images.append((image, url.lastPathComponent))
-                }
-            }
-
-            if !images.isEmpty {
+            let imageURLs = urls.filter { Self.isImageURL($0) }
+            if !imageURLs.isEmpty {
                 DispatchQueue.main.async {
-                    self.onImageDrop(images)
+                    self.onImageDrop(imageURLs)
                 }
                 return true
             }
@@ -1075,6 +2297,11 @@ class CustomNSTextView: NSTextView {
         }
         // Allow text drops
         return super.performDragOperation(sender)
+    }
+
+    static func isImageURL(_ url: URL) -> Bool {
+        ["jpg", "jpeg", "png", "gif", "heic", "heif", "bmp", "webp", "tiff", "tif"]
+            .contains(url.pathExtension.lowercased())
     }
 
     func getCharacterIndex(at point: NSPoint) -> Int {
@@ -1102,11 +2329,16 @@ class CustomNSTextView: NSTextView {
             self?.justBecameFirstResponder = false
         }
         onFocusChanged?(self)
+        // Set focusedTextItemId immediately on click, not just on first keystroke.
+        // Without this, clicking a text area without typing leaves focusedTextItemId nil,
+        // causing "Add Video" (and other cursor-dependent actions) to fall back to the end.
+        coordinator?.parent.onFocusChanged(true)
         return super.becomeFirstResponder()
     }
 
     override func resignFirstResponder() -> Bool {
         onFocusChanged?(nil)
+        coordinator?.parent.onFocusChanged(false)
         return super.resignFirstResponder()
     }
 
@@ -1150,78 +2382,137 @@ class CustomNSTextView: NSTextView {
                 }
             }
         }
+        // Escape: close find bar if open, then let NSTextView handle (e.g. dismiss autocomplete)
+        else if event.keyCode == 53 { // Escape
+            onEscapeKey?()
+        }
 
         super.keyDown(with: event)
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        // Check for Cmd-V (paste)
-        if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "v" {
-            if let onPaste = onPaste {
-                onPaste()
+        let char = event.charactersIgnoringModifiers ?? ""
+        let isCmd = event.modifierFlags.contains(.command)
+        let isShift = event.modifierFlags.contains(.shift)
+
+        // Handle Cmd-Z (undo) and Cmd-Shift-Z (redo)
+        if isCmd && char == "z" {
+            if isShift {
+                onRedo?()
+            } else {
+                onUndo?()
+            }
+            return true
+        }
+
+        // Check for Cmd-V (paste) — only intercept if our handler actually consumed it
+        if isCmd && char == "v" {
+            if let onPaste = onPaste, onPaste() {
                 return true
             }
+            // onPaste returned false (or wasn't set) — fall through to NSTextView default text paste
         }
 
-        // Check for Cmd-B (bold)
-        if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "b" {
-            let selectedRange = self.selectedRange()
-            if selectedRange.length > 0 {
-                applyFontTrait(.boldFontMask, range: selectedRange)
-            } else {
-                // Toggle bold in typing attributes
-                toggleTypingAttributeForTrait(.boldFontMask)
-            }
-            onSelectionChanged?()
-            return true
-        }
-
-        // Check for Cmd-I (italic)
-        if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "i" {
-            let selectedRange = self.selectedRange()
-            if selectedRange.length > 0 {
-                applyFontTrait(.italicFontMask, range: selectedRange)
-            } else {
-                // Toggle italic in typing attributes
-                toggleTypingAttributeForTrait(.italicFontMask)
-            }
-            onSelectionChanged?()
-            return true
-        }
-
-        // Check for Cmd-U (underline)
-        if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "u" {
-            let selectedRange = self.selectedRange()
-            if selectedRange.length > 0 {
-                guard let textStorage = textStorage else { return false }
-                let attrs = textStorage.attributes(at: selectedRange.location, effectiveRange: nil)
-                if attrs[.underlineStyle] != nil {
-                    textStorage.removeAttribute(.underlineStyle, range: selectedRange)
-                } else {
-                    textStorage.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: selectedRange)
-                }
-            } else {
-                // Toggle underline in typing attributes
-                var attrs = typingAttributes
-                if attrs[.underlineStyle] != nil {
-                    attrs.removeValue(forKey: .underlineStyle)
-                } else {
-                    attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
-                }
-                typingAttributes = attrs
-            }
-            onSelectionChanged?()
-            return true
-        }
+        // B/I/U are handled exclusively by the Format menu (via applyFormattingAction).
+        // Do NOT intercept them here — on macOS 14+ SwiftUI fires its .commands shortcuts
+        // at the app level, so double-handling would apply then immediately undo the style.
 
         return super.performKeyEquivalent(with: event)
+    }
+
+    // Implement standard NSResponder actions for Format menu
+    // Apply (or toggle off) a heading level for the current paragraph
+    private func applyHeadingLevel(_ level: Int) {
+        guard let textStorage = self.textStorage else { return }
+        let selectedRange = self.selectedRange()
+
+        let headingSizes: [Int: CGFloat] = kHeadingSizes
+        let targetSize = headingSizes[level]!
+
+        if textStorage.length == 0 {
+            // Empty text view — just set typing attributes
+            let font = headingFont(targetSize)
+            typingAttributes = [.font: font]
+            onSelectionChanged?()
+            return
+        }
+
+        let paragraphRange = (textStorage.string as NSString).paragraphRange(for: selectedRange)
+        let checkLoc = min(paragraphRange.location, textStorage.length - 1)
+        let currentFont = textStorage.attribute(.font, at: checkLoc, effectiveRange: nil) as? NSFont
+        let isAlready = currentFont.map {
+            $0.pointSize == targetSize && NSFontManager.shared.traits(of: $0).contains(.boldFontMask)
+        } ?? false
+
+        let newFont = isAlready ? bodyFont() : headingFont(targetSize)
+        let paraStyle: NSParagraphStyle = {
+            if isAlready { return .default }
+            let s = NSMutableParagraphStyle(); s.paragraphSpacing = 14; return s
+        }()
+
+        textStorage.beginEditing()
+        textStorage.addAttribute(.font, value: newFont, range: paragraphRange)
+        textStorage.addAttribute(.paragraphStyle, value: paraStyle, range: paragraphRange)
+        textStorage.endEditing()
+        typingAttributes = [.font: newFont, .paragraphStyle: paraStyle]
+        didChangeText()
+        onSelectionChanged?()
+    }
+
+    @objc func heading1(_ sender: Any?) { applyHeadingLevel(1) }
+    @objc func heading2(_ sender: Any?) { applyHeadingLevel(2) }
+    @objc func heading3(_ sender: Any?) { applyHeadingLevel(3) }
+
+    @objc func bold(_ sender: Any?) {
+        let selectedRange = self.selectedRange()
+        if selectedRange.length > 0 {
+            applyFontTrait(.boldFontMask, range: selectedRange)
+        } else {
+            toggleTypingAttributeForTrait(.boldFontMask)
+        }
+        onSelectionChanged?()
+        didChangeText()
+    }
+
+    @objc func italic(_ sender: Any?) {
+        let selectedRange = self.selectedRange()
+        if selectedRange.length > 0 {
+            applyFontTrait(.italicFontMask, range: selectedRange)
+        } else {
+            toggleTypingAttributeForTrait(.italicFontMask)
+        }
+        onSelectionChanged?()
+        didChangeText()
+    }
+
+    @objc override func underline(_ sender: Any?) {
+        let selectedRange = self.selectedRange()
+        if selectedRange.length > 0 {
+            guard let textStorage = textStorage else { return }
+            let attrs = textStorage.attributes(at: selectedRange.location, effectiveRange: nil)
+            if attrs[.underlineStyle] != nil {
+                textStorage.removeAttribute(.underlineStyle, range: selectedRange)
+            } else {
+                textStorage.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: selectedRange)
+            }
+        } else {
+            var attrs = typingAttributes
+            if attrs[.underlineStyle] != nil {
+                attrs.removeValue(forKey: .underlineStyle)
+            } else {
+                attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
+            }
+            typingAttributes = attrs
+        }
+        onSelectionChanged?()
+        didChangeText()
     }
 
     private func toggleTypingAttributeForTrait(_ trait: NSFontTraitMask) {
         var attrs = typingAttributes
 
         // Get current font or use default
-        let currentFont = attrs[.font] as? NSFont ?? NSFont.systemFont(ofSize: 14)
+        let currentFont = attrs[.font] as? NSFont ?? bodyFont()
         let fontManager = NSFontManager.shared
 
         // Check if trait is currently set
@@ -1302,15 +2593,19 @@ class CustomNSTextView: NSTextView {
             if checkLocation < textStorage.length {
                 let attrs = textStorage.attributes(at: checkLocation, effectiveRange: nil)
                 if let font = attrs[.font] as? NSFont {
-                    let isHeading = font.pointSize >= 16 && NSFontManager.shared.traits(of: font).contains(.boldFontMask)
+                    let isHeading = font.pointSize >= kHeadingSizes[3]! && NSFontManager.shared.traits(of: font).contains(.boldFontMask)
                     if isHeading {
                         // Insert newline and reset to normal font
                         textStorage.beginEditing()
-                        let normalFont = NSFont.systemFont(ofSize: 14)
+                        let normalFont = bodyFont()
                         let newlineAttr = NSAttributedString(string: "\n", attributes: [.font: normalFont])
                         textStorage.insert(newlineAttr, at: selectedRange.location)
                         textStorage.endEditing()
                         self.setSelectedRange(NSRange(location: selectedRange.location + 1, length: 0))
+                        // Explicitly reset typing attributes so the next line is body text,
+                        // not a continuation of the heading font.
+                        self.typingAttributes = [.font: normalFont, .foregroundColor: NSColor.textColor,
+                                                 .paragraphStyle: NSParagraphStyle.default]
                         self.didChangeText()
                         return true
                     }
@@ -1369,7 +2664,7 @@ class CustomNSTextView: NSTextView {
             }
             // Ensure we have a font
             if attrs[.font] == nil {
-                attrs[.font] = NSFont.systemFont(ofSize: 14)
+                attrs[.font] = bodyFont()
             }
 
             let newBulletAttr = NSAttributedString(string: newBullet, attributes: attrs)
@@ -1443,7 +2738,7 @@ class CustomNSTextView: NSTextView {
             }
             // Ensure we have a font
             if attrs[.font] == nil {
-                attrs[.font] = NSFont.systemFont(ofSize: 14)
+                attrs[.font] = bodyFont()
             }
 
             let newNumberAttr = NSAttributedString(string: newNumber, attributes: attrs)
@@ -1474,7 +2769,7 @@ class CustomNSTextView: NSTextView {
                 attrs = textStorage.attributes(at: textStorage.length - 1, effectiveRange: nil)
             }
             if attrs[.font] == nil {
-                attrs[.font] = NSFont.systemFont(ofSize: 14)
+                attrs[.font] = bodyFont()
             }
 
             let spacesAttr = NSAttributedString(string: "  ", attributes: attrs)
@@ -1502,7 +2797,7 @@ class CustomNSTextView: NSTextView {
                 attrs = textStorage.attributes(at: textStorage.length - 1, effectiveRange: nil)
             }
             if attrs[.font] == nil {
-                attrs[.font] = NSFont.systemFont(ofSize: 14)
+                attrs[.font] = bodyFont()
             }
 
             // Replace the marker with the new level marker
@@ -1582,7 +2877,7 @@ class CustomNSTextView: NSTextView {
                 attrs = textStorage.attributes(at: textStorage.length - 1, effectiveRange: nil)
             }
             if attrs[.font] == nil {
-                attrs[.font] = NSFont.systemFont(ofSize: 14)
+                attrs[.font] = bodyFont()
             }
 
             // Replace the marker with the new level marker
@@ -1740,18 +3035,27 @@ class CustomNSTextView: NSTextView {
 struct EntryContentView: View {
     @ObservedObject var entry: BlogEntry
     @Binding var selectedItemId: UUID?
+    @Binding var captionEditingId: UUID?
     @Binding var focusedTextItemId: UUID?
     @Binding var selectedItemIds: Set<UUID>
+    @Binding var findScrollTargetId: UUID?
     let onNavigateUp: (Int) -> Void
     let onNavigateDown: (Int) -> Void
     let onDrop: ([NSItemProvider]) -> Void
     let onDelete: () -> Void
     let onArrowKey: (Bool) -> Void
+    let onEnterKey: () -> Void
+    let onEscapeKey: () -> Void
+    let onUpdateCaption: (UUID, String?) -> Void
     let onImageTap: (ImageItem, Int, NSEvent.ModifierFlags) -> Void
     let onVideoTap: (VideoItem, Int, NSEvent.ModifierFlags) -> Void
-    let onPaste: () -> Void
+    let onPaste: () -> Bool
     let onTextViewFocusChanged: (CustomNSTextView?) -> Void
     let onSelectionChanged: () -> Void
+    let onImageURLsDrop: ([URL], Int, Int?) -> Void
+    let onTextDidChange: () -> Void
+    var onUndo: (() -> Void)?
+    var onRedo: (() -> Void)?
     @State private var dropTargetIndex: Int? = nil
 
     var body: some View {
@@ -1787,127 +3091,93 @@ struct EntryContentView: View {
                 handleDropAtEnd(providers: providers)
                 return true
             }
-            .onChange(of: focusedTextItemId) { newId in
+            .onChange(of: focusedTextItemId) { _, newId in
                 if let id = newId {
                     withAnimation {
                         proxy.scrollTo(id, anchor: .center)
                     }
                 }
             }
-            .onChange(of: selectedItemId) { newId in
+            .onChange(of: selectedItemId) { _, newId in
                 if let id = newId {
                     withAnimation {
                         proxy.scrollTo(id, anchor: .center)
                     }
+                }
+            }
+            .onChange(of: findScrollTargetId) { _, newId in
+                if let id = newId {
+                    withAnimation {
+                        proxy.scrollTo(id, anchor: .center)
+                    }
+                    findScrollTargetId = nil
                 }
             }
         }
         .background(Color(NSColor.textBackgroundColor))
         .background(KeyboardHandler(
             selectedItemId: $selectedItemId,
+            captionEditingId: captionEditingId,
             onDelete: onDelete,
             onArrowUp: { onArrowKey(true) },
-            onArrowDown: { onArrowKey(false) }
+            onArrowDown: { onArrowKey(false) },
+            onEnter: onEnterKey,
+            onEscape: onEscapeKey
         ))
     }
 
-    private func handleTextItemImageDrop(images: [(NSImage, String)], at index: Int, textItem: TextItem) {
-        // Insert at cursor position
+    private func handleTextItemImageDrop(urls: [URL], at index: Int, textItem: TextItem) {
         let cursorPos = (focusedTextItemId == textItem.id) ? textItem.currentCursorPosition : nil
-        entry.insertImages(images, at: index, cursorPosition: cursorPos)
-
-        // Focus on the text item after the last inserted image
-        let newFocusIndex = index + (images.count * 2)
-        if newFocusIndex < entry.items.count,
-           case .text(let newTextItem) = entry.items[newFocusIndex] {
-            focusedTextItemId = newTextItem.id
-        }
+        onImageURLsDrop(urls, index, cursorPos)
     }
 
     private func handleDropAtEnd(providers: [NSItemProvider]) {
-        // Collect all images first
-        var imagesToAdd: [(NSImage, String)] = []
-        let group = DispatchGroup()
-
-        for provider in providers {
-            group.enter()
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { (item, error) in
-                if let data = item as? Data,
-                   let url = URL(dataRepresentation: data, relativeTo: nil),
-                   let image = NSImage(contentsOf: url) {
-                    let filename = url.lastPathComponent
-                    DispatchQueue.main.async {
-                        imagesToAdd.append((image, filename))
-                        group.leave()
-                    }
-                } else {
-                    group.leave()
-                }
-            }
-        }
-
-        // When all images are loaded, insert them at the end
-        group.notify(queue: .main) {
-            guard !imagesToAdd.isEmpty else { return }
-
-            let lastIndex = entry.items.count - 1
-            entry.insertImages(imagesToAdd, at: lastIndex, cursorPosition: nil)
-
-            // Focus on the text item after the last inserted image
-            let newFocusIndex = lastIndex + (imagesToAdd.count * 2)
-            if newFocusIndex < entry.items.count,
-               case .text(let newTextItem) = entry.items[newFocusIndex] {
-                focusedTextItemId = newTextItem.id
-            }
+        Task {
+            let urls = await loadFileURLs(from: providers).filter { CustomNSTextView.isImageURL($0) }
+            guard !urls.isEmpty else { return }
+            let lastIndex = await MainActor.run { entry.items.count - 1 }
+            await MainActor.run { onImageURLsDrop(urls, lastIndex, nil) }
         }
     }
 
     private func handleItemDrop(providers: [NSItemProvider], at index: Int) {
-        // Collect all images first
-        var imagesToAdd: [(NSImage, String)] = []
-        let group = DispatchGroup()
-
-        for provider in providers {
-            group.enter()
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { (item, error) in
-                if let data = item as? Data,
-                   let url = URL(dataRepresentation: data, relativeTo: nil),
-                   let image = NSImage(contentsOf: url) {
-                    let filename = url.lastPathComponent
-                    DispatchQueue.main.async {
-                        imagesToAdd.append((image, filename))
-                        group.leave()
-                    }
-                } else {
-                    group.leave()
+        Task {
+            let urls = await loadFileURLs(from: providers).filter { CustomNSTextView.isImageURL($0) }
+            guard !urls.isEmpty else { return }
+            await MainActor.run {
+                switch entry.items[index] {
+                case .text(let textItem):
+                    let cursorPos = (focusedTextItemId == textItem.id) ? textItem.currentCursorPosition : nil
+                    onImageURLsDrop(urls, index, cursorPos)
+                case .image, .video:
+                    onImageURLsDrop(urls, index, nil)
                 }
             }
         }
+    }
 
-        // When all images are loaded, insert them
-        group.notify(queue: .main) {
-            guard !imagesToAdd.isEmpty else { return }
-
-            let item = entry.items[index]
-            switch item {
-            case .text(let textItem):
-                // Insert at cursor position
-                // If this is the focused text item, use cursor position
-                // Otherwise, insert at the end (after all text)
-                let cursorPos = (focusedTextItemId == textItem.id) ? textItem.currentCursorPosition : nil
-                entry.insertImages(imagesToAdd, at: index, cursorPosition: cursorPos)
-
-                // Focus on the text item after the last inserted image
-                let newFocusIndex = index + (imagesToAdd.count * 2)
-                if newFocusIndex < entry.items.count,
-                   case .text(let newTextItem) = entry.items[newFocusIndex] {
-                    focusedTextItemId = newTextItem.id
+    // Collect file URLs from NSItemProviders in original order
+    private func loadFileURLs(from providers: [NSItemProvider]) async -> [URL] {
+        await withTaskGroup(of: (Int, URL?).self) { group in
+            for (i, provider) in providers.enumerated() {
+                group.addTask {
+                    await withCheckedContinuation { cont in
+                        provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { item, _ in
+                            if let data = item as? Data,
+                               let url = URL(dataRepresentation: data, relativeTo: nil) {
+                                cont.resume(returning: (i, url))
+                            } else {
+                                cont.resume(returning: (i, nil))
+                            }
+                        }
+                    }
                 }
-
-            case .image, .video:
-                // Insert after this item
-                entry.insertImages(imagesToAdd, at: index, cursorPosition: nil)
             }
+            var results: [(Int, URL)] = []
+            for await (i, url) in group {
+                if let url = url { results.append((i, url)) }
+            }
+            return results.sorted { $0.0 < $1.0 }.map { $0.1 }
         }
     }
 
@@ -1932,19 +3202,31 @@ struct EntryContentView: View {
                         focusedTextItemId = nil
                     }
                 },
-                onImageDrop: { images in
-                    handleTextItemImageDrop(images: images, at: index, textItem: textItem)
+                onImageDrop: { urls in
+                    handleTextItemImageDrop(urls: urls, at: index, textItem: textItem)
                 },
                 onPaste: onPaste,
                 onTextViewFocusChanged: onTextViewFocusChanged,
-                onSelectionChanged: onSelectionChanged
+                onSelectionChanged: onSelectionChanged,
+                onTextDidChange: onTextDidChange,
+                onUndo: onUndo,
+                onRedo: onRedo,
+                onEscapeKey: onEscapeKey
             )
         case .image(let imageItem):
             ImageItemView(
                 imageItem: imageItem,
                 isSelected: selectedItemId == imageItem.id || selectedItemIds.contains(imageItem.id),
+                isEditingCaption: captionEditingId == imageItem.id,
                 onTap: { modifiers in
                     onImageTap(imageItem, index, modifiers)
+                },
+                onTapCaption: {
+                    captionEditingId = imageItem.id
+                },
+                onCaptionCommit: { newCaption in
+                    onUpdateCaption(imageItem.id, newCaption)
+                    captionEditingId = nil
                 }
             )
         case .video(let videoItem):
@@ -1962,23 +3244,39 @@ struct EntryContentView: View {
 // Keyboard event handler for when items are selected
 struct KeyboardHandler: NSViewRepresentable {
     @Binding var selectedItemId: UUID?
+    var captionEditingId: UUID?
     let onDelete: () -> Void
     let onArrowUp: () -> Void
     let onArrowDown: () -> Void
+    let onEnter: () -> Void
+    let onEscape: () -> Void
 
     func makeNSView(context: Context) -> NSView {
         let view = KeyHandlingView()
         view.onDelete = onDelete
         view.onArrowUp = onArrowUp
         view.onArrowDown = onArrowDown
+        view.onEnter = onEnter
+        view.onEscape = onEscape
         view.selectedItemId = selectedItemId
+        view.captionEditingId = captionEditingId
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
         if let keyView = nsView as? KeyHandlingView {
+            // Steal focus when first selecting an item (nil → non-nil),
+            // or when caption editing ends while an item is still selected
+            // (caption's TextEditor had focus; we need to reclaim it).
+            let prevId = keyView.selectedItemId
+            let prevCaptionId = keyView.captionEditingId
             keyView.selectedItemId = selectedItemId
-            if selectedItemId != nil {
+            keyView.captionEditingId = captionEditingId
+            keyView.onEnter = onEnter
+            keyView.onEscape = onEscape
+            let justSelected = selectedItemId != nil && prevId == nil
+            let captionJustEnded = selectedItemId != nil && prevCaptionId != nil && captionEditingId == nil
+            if justSelected || captionJustEnded {
                 nsView.window?.makeFirstResponder(nsView)
             }
         }
@@ -1987,9 +3285,12 @@ struct KeyboardHandler: NSViewRepresentable {
 
 class KeyHandlingView: NSView {
     var selectedItemId: UUID?
+    var captionEditingId: UUID?
     var onDelete: (() -> Void)?
     var onArrowUp: (() -> Void)?
     var onArrowDown: (() -> Void)?
+    var onEnter: (() -> Void)?
+    var onEscape: (() -> Void)?
 
     override var acceptsFirstResponder: Bool { return selectedItemId != nil }
 
@@ -2002,6 +3303,10 @@ class KeyHandlingView: NSView {
         switch event.keyCode {
         case 51, 117: // Delete or Forward Delete
             onDelete?()
+        case 36: // Return/Enter
+            onEnter?()
+        case 53: // Escape
+            onEscape?()
         case 126: // Up arrow
             onArrowUp?()
         case 125: // Down arrow
@@ -2015,15 +3320,92 @@ class KeyHandlingView: NSView {
 struct ImageItemView: View {
     let imageItem: ImageItem
     let isSelected: Bool
+    let isEditingCaption: Bool
     let onTap: (NSEvent.ModifierFlags) -> Void
+    let onTapCaption: () -> Void
+    let onCaptionCommit: (String?) -> Void
+
+    @FocusState private var captionFocused: Bool
+    @State private var captionDraft: String = ""
+    @State private var captionCommitted = false
+    @State private var loadedImage: NSImage? = nil
+    @State private var loadFailed = false
+
+    private var displayImage: NSImage? { imageItem.resizedImage ?? loadedImage }
+
+    private func commitCaption() {
+        guard !captionCommitted else { return }
+        captionCommitted = true
+        let trimmed = captionDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        onCaptionCommit(trimmed.isEmpty ? nil : trimmed)
+    }
 
     var body: some View {
-        Group {
-            if let resizedImage = imageItem.resizedImage {
-                Image(nsImage: resizedImage)
+        VStack(spacing: 0) {
+            if let img = displayImage {
+                Image(nsImage: img)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .frame(maxWidth: 640, maxHeight: 640)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        if let event = NSApp.currentEvent {
+                            onTap(event.modifierFlags)
+                        } else {
+                            onTap([])
+                        }
+                    }
+            } else {
+                // Placeholder shown while the image loads lazily (or if it failed)
+                Rectangle()
+                    .fill(Color(NSColor.controlBackgroundColor))
+                    .frame(width: 640, height: 480)
+                    .overlay {
+                        if loadFailed {
+                            VStack(spacing: 8) {
+                                Image(systemName: "photo.badge.exclamationmark")
+                                    .font(.system(size: 40))
+                                    .foregroundColor(.secondary)
+                                Text(imageItem.smallURL?.lastPathComponent ?? imageItem.filename)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        } else {
+                            ProgressView()
+                        }
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        if let event = NSApp.currentEvent {
+                            onTap(event.modifierFlags)
+                        } else {
+                            onTap([])
+                        }
+                    }
+            }
+
+            if isEditingCaption {
+                TextEditor(text: $captionDraft)
+                    .font(.caption)
+                    .multilineTextAlignment(.center)
+                    .frame(minHeight: 36, maxHeight: 80)
+                    .focused($captionFocused)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .onKeyPress(.escape) {
+                        commitCaption()
+                        return .handled
+                    }
+            } else if let caption = imageItem.caption,
+                      !caption.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text(caption)
+                    .font(.caption)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .contentShape(Rectangle())
+                    .onTapGesture { onTapCaption() }
             }
         }
         .background(Color(hex: "eeeeff"))
@@ -2031,12 +3413,37 @@ struct ImageItemView: View {
             Rectangle()
                 .stroke(isSelected ? Color.blue : Color.clear, lineWidth: 3)
         )
-        .contentShape(Rectangle())
-        .onTapGesture {
-            if let event = NSApp.currentEvent {
-                onTap(event.modifierFlags)
+        .onChange(of: isEditingCaption) { _, editing in
+            if editing {
+                captionDraft = imageItem.caption ?? ""
+                captionCommitted = false
+                DispatchQueue.main.async { captionFocused = true }
             } else {
-                onTap([])
+                // Editing ended externally (e.g. clicking another image) — commit the draft
+                commitCaption()
+            }
+        }
+        .onChange(of: captionFocused) { _, focused in
+            guard isEditingCaption, !focused else { return }
+            commitCaption()
+        }
+        .onAppear {
+            if isEditingCaption {
+                captionDraft = imageItem.caption ?? ""
+                captionCommitted = false
+                DispatchQueue.main.async { captionFocused = true }
+            }
+            // Lazy-load the thumbnail if not already in memory
+            guard displayImage == nil, let smallURL = imageItem.smallURL else { return }
+            Task.detached(priority: .userInitiated) {
+                let img = NSImage(contentsOf: smallURL)
+                await MainActor.run {
+                    if let img {
+                        loadedImage = img
+                    } else {
+                        loadFailed = true
+                    }
+                }
             }
         }
     }
@@ -2224,51 +3631,79 @@ class FormatNSButton: NSButton {
     }
 }
 
-// CutPasteHandler monitors keyboard events for cut/paste shortcuts
+// CutPasteHandler monitors keyboard events for cut/paste/undo/redo shortcuts
 struct CutPasteHandler: NSViewRepresentable {
     let canCut: Bool
     let canPaste: Bool
+    let canUndo: Bool
+    let canRedo: Bool
     let onCut: () -> Void
     let onPaste: () -> Void
+    let onUndo: () -> Void
+    let onRedo: () -> Void
 
     func makeNSView(context: Context) -> CutPasteHandlingView {
         let view = CutPasteHandlingView()
         view.canCut = canCut
         view.canPaste = canPaste
+        view.canUndo = canUndo
+        view.canRedo = canRedo
         view.onCut = onCut
         view.onPaste = onPaste
+        view.onUndo = onUndo
+        view.onRedo = onRedo
         return view
     }
 
     func updateNSView(_ nsView: CutPasteHandlingView, context: Context) {
         nsView.canCut = canCut
         nsView.canPaste = canPaste
+        nsView.canUndo = canUndo
+        nsView.canRedo = canRedo
         nsView.onCut = onCut
         nsView.onPaste = onPaste
+        nsView.onUndo = onUndo
+        nsView.onRedo = onRedo
     }
 }
 
 class CutPasteHandlingView: NSView {
     var canCut: Bool = false
     var canPaste: Bool = false
+    var canUndo: Bool = false
+    var canRedo: Bool = false
     var onCut: (() -> Void)?
     var onPaste: (() -> Void)?
+    var onUndo: (() -> Void)?
+    var onRedo: (() -> Void)?
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        // Check for Cmd-X (cut)
-        if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "x" {
-            if canCut {
-                onCut?()
+        let char = event.charactersIgnoringModifiers ?? ""
+        let isCmd = event.modifierFlags.contains(.command)
+        let isShift = event.modifierFlags.contains(.shift)
+
+        // Handle Cmd-Z (undo) and Cmd-Shift-Z (redo)
+        if isCmd && char == "z" {
+            if isShift && canRedo {
+                onRedo?()
+                return true
+            } else if !isShift && canUndo {
+                onUndo?()
                 return true
             }
         }
-        // Check for Cmd-V (paste)
-        if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "v" {
-            if canPaste {
-                onPaste?()
-                return true
-            }
+
+        // Only handle cut/paste, let other shortcuts pass through
+        if isCmd && char == "x" && canCut {
+            onCut?()
+            return true
         }
+        if isCmd && char == "v" && canPaste {
+            onPaste?()
+            return true
+        }
+
+        // Don't intercept formatting shortcuts - let them pass through to text view
         return super.performKeyEquivalent(with: event)
     }
 }
@@ -2277,7 +3712,7 @@ struct VideoDialogView: View {
     @Environment(\.dismiss) var dismiss
     @State private var youtubeURL = ""
     @State private var videoTitle = ""
-    let entry: BlogEntry
+    let onAdd: (String, String?) -> Void
 
     var body: some View {
         VStack(spacing: 16) {
@@ -2298,8 +3733,7 @@ struct VideoDialogView: View {
                 Spacer()
 
                 Button("Add") {
-                    entry.addVideo(url: youtubeURL,
-                                 title: videoTitle.isEmpty ? nil : videoTitle)
+                    onAdd(youtubeURL, videoTitle.isEmpty ? nil : videoTitle)
                     dismiss()
                 }
                 .disabled(youtubeURL.isEmpty)
@@ -2307,5 +3741,83 @@ struct VideoDialogView: View {
         }
         .padding()
         .frame(width: 400)
+    }
+}
+
+// MARK: - Article Sidebar
+
+struct ArticleSidebarView: View {
+    let articles: [ArticleEntry]
+    let selectedFolderURL: URL?
+    let onSelect: (ArticleEntry) -> Void
+    let onNew: () -> Void
+
+    // Stable selection key: standardized folder path string (survives articleManager.refresh())
+    private var selectionBinding: Binding<String?> {
+        Binding(
+            get: { selectedFolderURL?.standardized.path },
+            set: { newPath in
+                guard let path = newPath,
+                      let article = articles.first(where: { $0.folderURL.standardized.path == path })
+                else { return }
+                onSelect(article)
+            }
+        )
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            List(articles, id: \.folderURL, selection: selectionBinding) { article in
+                ArticleRowView(article: article)
+                    .tag(article.folderURL.standardized.path)
+            }
+            .listStyle(.sidebar)
+
+            Divider()
+
+            HStack {
+                Button(action: onNew) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 14))
+                }
+                .buttonStyle(.borderless)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .help("New article")
+                Spacer()
+            }
+            .background(Color(NSColor.controlBackgroundColor))
+        }
+    }
+}
+
+struct ArticleRowView: View {
+    let article: ArticleEntry
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                if !article.dateString.isEmpty {
+                    Text(article.dateString)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                if article.isDraft {
+                    Text("Draft")
+                        .font(.caption2)
+                        .foregroundColor(.orange)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.orange.opacity(0.15))
+                        .cornerRadius(3)
+                }
+                Spacer()
+            }
+            Text(article.displayTitle)
+                .font(.body)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 2)
     }
 }
