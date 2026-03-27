@@ -20,11 +20,11 @@ struct EntrySnapshot {
 }
 
 // Manages undo/redo via whole-entry snapshots
-class UndoCoordinator: ObservableObject {
-    @Published var canUndo: Bool = false
-    @Published var canRedo: Bool = false
-    @Published var undoActionName: String = ""
-    @Published var redoActionName: String = ""
+public class UndoCoordinator: ObservableObject {
+    @Published public var canUndo: Bool = false
+    @Published public var canRedo: Bool = false
+    @Published public var undoActionName: String = ""
+    @Published public var redoActionName: String = ""
 
     private var undoStack: [(before: EntrySnapshot, after: EntrySnapshot)] = []
     private var redoStack: [(before: EntrySnapshot, after: EntrySnapshot)] = []
@@ -34,6 +34,9 @@ class UndoCoordinator: ObservableObject {
 
     // Typing grouping: only snapshot on the first keystroke of a typing session
     var needsTypingSnapshot: Bool = true
+    private var lastTypingTime: Date?
+    private var lastTypedCharForGrouping: Character?
+    private var pendingGroupBreak = false
 
     // MARK: - Clear
 
@@ -42,6 +45,9 @@ class UndoCoordinator: ObservableObject {
         redoStack.removeAll()
         pendingSnapshot = nil
         needsTypingSnapshot = true
+        lastTypingTime = nil
+        lastTypedCharForGrouping = nil
+        pendingGroupBreak = false
         canUndo = false
         canRedo = false
         undoActionName = ""
@@ -117,22 +123,39 @@ class UndoCoordinator: ObservableObject {
 
     // MARK: - Typing Grouping
 
-    // Called on every textDidChange. Only takes a snapshot on the first keystroke.
+    // Called on every textDidChange. Groups typing by time and sentence boundaries.
     func handleTyping(
         entry: BlogEntry,
         focusedTextItemId: UUID?,
-        selectedItemId: UUID?
+        selectedItemId: UUID?,
+        lastTypedChar: Character?
     ) {
         guard !isRestoring else { return }
+        let now = Date()
+
+        // Break the current group on timeout (2.5s pause) or sentence boundary
+        if !needsTypingSnapshot && pendingSnapshot != nil {
+            let timedOut = lastTypingTime.map { now.timeIntervalSince($0) > 2.5 } ?? false
+            if timedOut || pendingGroupBreak {
+                commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+                needsTypingSnapshot = true
+                pendingGroupBreak = false
+            }
+        }
+
+        // Take a "before" snapshot at the start of each new group
         if needsTypingSnapshot {
-            takeSnapshot(
-                entry: entry,
-                actionName: "Typing",
-                focusedTextItemId: focusedTextItemId,
-                selectedItemId: selectedItemId
-            )
+            takeSnapshot(entry: entry, actionName: "Typing", focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
             needsTypingSnapshot = false
         }
+
+        // Schedule a break after the space/newline that follows a sentence-ending character
+        if let prev = lastTypedCharForGrouping, ".!?".contains(prev),
+           let curr = lastTypedChar, curr == " " || curr == "\n" {
+            pendingGroupBreak = true
+        }
+        lastTypedCharForGrouping = lastTypedChar
+        lastTypingTime = now
     }
 
     // Commit pending typing action (called before non-typing actions)
@@ -149,6 +172,9 @@ class UndoCoordinator: ObservableObject {
                 selectedItemId: selectedItemId
             )
             needsTypingSnapshot = true
+            lastTypingTime = nil
+            lastTypedCharForGrouping = nil
+            pendingGroupBreak = false
         }
     }
 
@@ -201,6 +227,9 @@ class UndoCoordinator: ObservableObject {
         defer {
             isRestoring = false
             needsTypingSnapshot = true
+            lastTypingTime = nil
+            lastTypedCharForGrouping = nil
+            pendingGroupBreak = false
         }
 
         entry.suspendChangeTracking()

@@ -76,6 +76,7 @@ class HTMLParser {
         }
 
         var skippedTitleH1 = false
+        var lastNonEmptyWasHeading = false
         for child in bodyNode.children ?? [] {
             guard let element = child as? XMLElement else { continue }
 
@@ -124,15 +125,27 @@ class HTMLParser {
                         }
 
                     case "a":
-                        // Image anchor: <a href="full/..."><img src="small/..."></a>
-                        guard let imgEl = childEl.elements(forName: "img").first else { continue }
-                        if !foundMedia {
-                            appendTextItem(from: currentTextContent, into: entry)
-                            currentTextContent = NSMutableAttributedString()
-                            foundMedia = true
-                        }
-                        if let imageItem = loadImage(from: imgEl, baseURL: baseURL, fullFilenameMap: fullFilenameMap) {
-                            entry.items.append(.image(imageItem))
+                        // Image anchor: <a href="..."><img src="..."></a>
+                        if let imgEl = childEl.elements(forName: "img").first {
+                            if !foundMedia {
+                                appendTextItem(from: currentTextContent, into: entry)
+                                currentTextContent = NSMutableAttributedString()
+                                foundMedia = true
+                            }
+                            if let imageItem = loadImage(from: imgEl, baseURL: baseURL, fullFilenameMap: fullFilenameMap) {
+                                entry.items.append(.image(imageItem))
+                            }
+                        } else if let href = childEl.attribute(forName: "href")?.stringValue,
+                                  href.contains("youtube.com") || href.contains("youtu.be") {
+                            // YouTube link without image thumbnail — treat as video
+                            if !foundMedia {
+                                appendTextItem(from: currentTextContent, into: entry)
+                                currentTextContent = NSMutableAttributedString()
+                                foundMedia = true
+                            }
+                            let title = childEl.stringValue
+                            let videoItem = VideoItem(youtubeURL: href, title: title?.isEmpty == true ? nil : title)
+                            entry.items.append(.video(videoItem))
                         }
 
                     case "img":
@@ -153,11 +166,26 @@ class HTMLParser {
                 if !foundMedia {
                     // Pure text paragraph — accumulate normally
                     let attributed = try parseElement(element, baseURL: baseURL)
+                    let isH1 = element.name?.lowercased() == "h1"
                     if !attributed.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        if isH1 {
+                            // Strip any trailing blank line immediately before a heading
+                            if currentTextContent.length > 0,
+                               (currentTextContent.string as NSString).character(at: currentTextContent.length - 1) == 10 {
+                                currentTextContent.deleteCharacters(in: NSRange(location: currentTextContent.length - 1, length: 1))
+                            }
+                        }
                         if currentTextContent.length > 0 {
                             currentTextContent.append(NSAttributedString(string: "\n"))
                         }
                         currentTextContent.append(attributed)
+                        lastNonEmptyWasHeading = isH1
+                    } else if currentTextContent.length > 0 && !lastNonEmptyWasHeading {
+                        // Empty <p></p> represents a blank line — skip if last element was a heading
+                        let lastChar = (currentTextContent.string as NSString).character(at: currentTextContent.length - 1)
+                        if lastChar != 10 {
+                            currentTextContent.append(NSAttributedString(string: "\n"))
+                        }
                     }
                 }
 
@@ -167,15 +195,21 @@ class HTMLParser {
                 if elementClass.contains("date-header") || elementClass.contains("entry-title") {
                     continue
                 }
-                // Accumulate text content
-                // Note: documentTidyHTML converts <p></p> to <p> </p>, so check for
-                // whitespace-only content rather than just length == 0
+                let isHeading = element.name?.lowercased() == "h2" || element.name?.lowercased() == "h3"
                 let attributed = try parseElement(element, baseURL: baseURL)
                 if !attributed.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    if isHeading {
+                        // Strip any trailing blank line immediately before a heading
+                        if currentTextContent.length > 0,
+                           (currentTextContent.string as NSString).character(at: currentTextContent.length - 1) == 10 {
+                            currentTextContent.deleteCharacters(in: NSRange(location: currentTextContent.length - 1, length: 1))
+                        }
+                    }
                     if currentTextContent.length > 0 {
                         currentTextContent.append(NSAttributedString(string: "\n"))
                     }
                     currentTextContent.append(attributed)
+                    lastNonEmptyWasHeading = isHeading
                 }
 
             case "a":
@@ -281,21 +315,61 @@ class HTMLParser {
 
         switch element.name?.lowercased() {
         case "p", "h1", "h2", "h3":
-            let attributed = try parseInlineContent(element)
+            let raw = try parseInlineContent(element)
+            // Trim trailing whitespace/newlines that libxml2 tidy inserts into text nodes
+            var trimLen = raw.length
+            while trimLen > 0 {
+                let ch = (raw.string as NSString).character(at: trimLen - 1)
+                if ch == 10 || ch == 13 || ch == 32 || ch == 9 { trimLen -= 1 } else { break }
+            }
+            let trimmed = trimLen < raw.length
+                ? raw.attributedSubstring(from: NSRange(location: 0, length: trimLen))
+                : raw
 
             // Check for heading sizes
             if element.name?.lowercased() == "h1" {
-                result.append(applyHeadingSize(attributed, size: kHeadingSizes[1]!))
+                // Strip internal newlines — headings are single-line
+                let clean = NSMutableAttributedString(attributedString: trimmed)
+                var i = clean.length - 1
+                while i >= 0 {
+                    let ch = (clean.string as NSString).character(at: i)
+                    if ch == 10 || ch == 13 { clean.deleteCharacters(in: NSRange(location: i, length: 1)) }
+                    i -= 1
+                }
+                result.append(applyHeadingSize(clean, size: kHeadingSizes[1]!))
             } else if element.name?.lowercased() == "h2" {
-                result.append(applyHeadingSize(attributed, size: kHeadingSizes[2]!))
+                let clean = NSMutableAttributedString(attributedString: trimmed)
+                var i = clean.length - 1
+                while i >= 0 {
+                    let ch = (clean.string as NSString).character(at: i)
+                    if ch == 10 || ch == 13 { clean.deleteCharacters(in: NSRange(location: i, length: 1)) }
+                    i -= 1
+                }
+                result.append(applyHeadingSize(clean, size: kHeadingSizes[2]!))
             } else if element.name?.lowercased() == "h3" {
-                result.append(applyHeadingSize(attributed, size: kHeadingSizes[3]!))
+                let clean = NSMutableAttributedString(attributedString: trimmed)
+                var i = clean.length - 1
+                while i >= 0 {
+                    let ch = (clean.string as NSString).character(at: i)
+                    if ch == 10 || ch == 13 { clean.deleteCharacters(in: NSRange(location: i, length: 1)) }
+                    i -= 1
+                }
+                result.append(applyHeadingSize(clean, size: kHeadingSizes[3]!))
             } else {
-                result.append(attributed)
+                result.append(trimmed)
             }
 
         case "ul", "ol":
-            result.append(try parseList(element, level: 0, isNumbered: element.name?.lowercased() == "ol"))
+            let raw = try parseList(element, level: 0, isNumbered: element.name?.lowercased() == "ol")
+            // Trim trailing newline that parseList adds after the last item
+            var trimLen = raw.length
+            while trimLen > 0 {
+                let ch = (raw.string as NSString).character(at: trimLen - 1)
+                if ch == 10 || ch == 13 { trimLen -= 1 } else { break }
+            }
+            result.append(trimLen < raw.length
+                ? raw.attributedSubstring(from: NSRange(location: 0, length: trimLen))
+                : raw)
 
         default:
             break
@@ -375,11 +449,13 @@ class HTMLParser {
             var hasNestedList = false
             for liChild in li.children ?? [] {
                 if liChild.kind == .text {
-                    if let content = liChild.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) {
-                        if !content.isEmpty {
-                            result.append(NSAttributedString(string: content,
-                                                             attributes: [.font: bodyFont()]))
-                        }
+                    // Skip purely-whitespace nodes (tidy indentation), but preserve the
+                    // original content verbatim for non-empty nodes so that meaningful
+                    // leading spaces (e.g. the space in "</b> word") are not stripped.
+                    if let content = liChild.stringValue,
+                       !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        result.append(NSAttributedString(string: content,
+                                                         attributes: [.font: bodyFont()]))
                     }
                 } else if let childElement = liChild as? XMLElement {
                     if childElement.name?.lowercased() == "ul" || childElement.name?.lowercased() == "ol" {
@@ -427,7 +503,33 @@ class HTMLParser {
         let content = len < text.length
             ? NSMutableAttributedString(attributedString: text.attributedSubstring(from: NSRange(location: 0, length: len)))
             : text
+        // NSLayoutManager uses the paragraph terminator's (\\n) paragraph style, not the
+        // text characters'. Move paragraphSpacing from heading text chars onto their \\n
+        // terminator so rendering is consistent between first creation and reload.
+        applyHeadingParagraphSpacingToTerminators(in: content)
         entry.items.append(.text(TextItem(attributedContent: content)))
+    }
+
+    // For each heading run, copy its paragraphSpacing onto the \\n that follows it.
+    private static func applyHeadingParagraphSpacingToTerminators(in text: NSMutableAttributedString) {
+        guard text.length > 0 else { return }
+        var fixes: [NSRange] = []
+        text.enumerateAttribute(.font, in: NSRange(location: 0, length: text.length), options: []) { value, subRange, _ in
+            guard let font = value as? NSFont,
+                  font.pointSize >= kHeadingSizes[3]!,
+                  NSFontManager.shared.traits(of: font).contains(.boldFontMask) else { return }
+            let nextPos = subRange.location + subRange.length
+            if nextPos < text.length,
+               (text.string as NSString).character(at: nextPos) == 10 {
+                fixes.append(NSRange(location: nextPos, length: 1))
+            }
+        }
+        guard !fixes.isEmpty else { return }
+        let style = NSMutableParagraphStyle()
+        style.paragraphSpacing = 14
+        for range in fixes {
+            text.addAttribute(.paragraphStyle, value: style, range: range)
+        }
     }
 
     // Returns a lazy ImageItem for an image found during HTML parsing.
@@ -531,8 +633,9 @@ class HTMLParser {
             result.addAttribute(.font, value: font, range: subRange)
         }
 
-        // Add a blank-line gap below the heading (display only — not written to HTML)
+        // Add spacing above and below the heading (display only — not written to HTML)
         let style = NSMutableParagraphStyle()
+        style.paragraphSpacingBefore = 14
         style.paragraphSpacing = 14
         result.addAttribute(.paragraphStyle, value: style, range: range)
 

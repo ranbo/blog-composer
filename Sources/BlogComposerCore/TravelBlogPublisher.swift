@@ -3,9 +3,9 @@
 import Foundation
 import ImageIO
 
-class TravelBlogPublisher {
+public class TravelBlogPublisher {
 
-    static let travelBlogDir = FileManager.default.homeDirectoryForCurrentUser
+    public static let travelBlogDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Documents/Journal/TravelBlog")
 
     // MARK: - Publish Entry

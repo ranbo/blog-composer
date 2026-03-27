@@ -13,9 +13,20 @@ let package = Package(
         )
     ],
     targets: [
+        .target(
+            name: "BlogComposerCore",
+            path: "Sources/BlogComposerCore"
+        ),
         .executableTarget(
             name: "BlogComposer",
-            path: "Sources"
+            dependencies: ["BlogComposerCore"],
+            path: "Sources/BlogComposerApp"
+        ),
+        .testTarget(
+            name: "BlogComposerTests",
+            dependencies: ["BlogComposerCore"],
+            path: "Tests/BlogComposerTests",
+            resources: [.copy("Fixtures")]
         )
     ]
 )

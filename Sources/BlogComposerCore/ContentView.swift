@@ -143,7 +143,8 @@ struct FindBarView: View {
     }
 }
 
-struct ContentView: View {
+public struct ContentView: View {
+    public init() {}
     @StateObject private var entry = BlogEntry()
     @StateObject private var undoCoordinator = UndoCoordinator()
     @State private var showVideoDialog = false
@@ -409,11 +410,12 @@ struct ContentView: View {
                 onImageURLsDrop: { urls, index, cursorPos in
                     importImages(urls: urls, at: index, cursorPosition: cursorPos)
                 },
-                onTextDidChange: {
+                onTextDidChange: { lastTypedChar in
                     undoCoordinator.handleTyping(
                         entry: entry,
                         focusedTextItemId: focusedTextItemId,
-                        selectedItemId: selectedItemId
+                        selectedItemId: selectedItemId,
+                        lastTypedChar: lastTypedChar
                     )
                 },
                 onUndo: performUndo,
@@ -431,7 +433,7 @@ struct ContentView: View {
         }
     }
 
-    var body: some View {
+    public var body: some View {
         mainLayout
             .focusedValue(\.undoCoordinator, undoCoordinator)
             .focusedValue(\.undoAction, performUndo)
@@ -443,6 +445,7 @@ struct ContentView: View {
             .focusedValue(\.findNextAction, findNext)
             .focusedValue(\.findPreviousAction, findPrevious)
             .focusedValue(\.newEntryAction, createNewArticle)
+            .focusedValue(\.saveAction, { saveEntry(isManualSave: true) })
     }
 
     private var mediaCount: Int {
@@ -1128,6 +1131,16 @@ struct ContentView: View {
 
         // Store items in clipboard
         clipboard = indicesToCut.map { entry.items[$0] }
+
+        // Write cut text to the system pasteboard so our changeCount is always fresh.
+        // Without this, a previously-copied system clipboard entry could have the same
+        // changeCount as our internal clipboard, causing the wrong thing to paste.
+        let cutText = clipboard.compactMap { item -> String? in
+            guard case .text(let t) = item, !t.content.isEmpty else { return nil }
+            return t.content
+        }.joined(separator: "\n\n")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(cutText.isEmpty ? " " : cutText, forType: .string)
         clipboardPasteboardCount = NSPasteboard.general.changeCount
 
         // Find text items before first and after last cut item
@@ -1200,66 +1213,70 @@ struct ContentView: View {
             selectedItemId = nil
             selectedItemIds.removeAll()
             pasteIntoText(at: focusedIndex, textItem: textItem)
+            undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+            return true
         } else if let selectedId = selectedItemId,
                   let selectedIndex = entry.items.firstIndex(where: { $0.id == selectedId }) {
             // Paste after selected image (matching drag-and-drop behavior), then clear selection
             selectedItemId = nil
             selectedItemIds.removeAll()
             pasteBeforeItem(at: selectedIndex + 1)
+            undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+            return true
         }
 
-        undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
-        return true
+        // No paste target — let the caller fall through to the system clipboard
+        return false
     }
 
     private func pasteIntoText(at index: Int, textItem: TextItem) {
-        // Split text at cursor position
-        let cursorPos = textItem.currentCursorPosition
-        let content = textItem.content
-        let splitPos = min(cursorPos, content.count)
-        let contentNS = content as NSString
+        let attrContent = textItem.attributedContent
+        // Split exactly at cursor — no end-of-line advancement
+        let splitPos = min(textItem.currentCursorPosition, attrContent.length)
 
-        // If cursor is at the start of a line (position 0 or immediately after \n),
-        // split right there. Otherwise advance to the end of the current line,
-        // stopping BEFORE the newline character.
-        let isAtLineStart = splitPos == 0 ||
-            (splitPos > 0 && contentNS.character(at: splitPos - 1) == 0x000A)
+        let attrBefore = attrContent.attributedSubstring(
+            from: NSRange(location: 0, length: splitPos))
+        let rawAfter = attrContent.attributedSubstring(
+            from: NSRange(location: splitPos, length: attrContent.length - splitPos))
 
-        let finalSplitPos: Int
-        if isAtLineStart {
-            finalSplitPos = splitPos
-        } else {
-            var pos = splitPos
-            while pos < content.count && contentNS.character(at: pos) != 0x000A {
-                pos += 1
-            }
-            finalSplitPos = pos
+        // Trim leading whitespace/newlines from the "after" portion
+        let nsAfter = rawAfter.string as NSString
+        var trimOffset = 0
+        while trimOffset < nsAfter.length {
+            let ch = nsAfter.character(at: trimOffset)
+            guard ch == 0x000A || ch == 0x000D || ch == 0x0020 else { break }
+            trimOffset += 1
         }
+        let attrAfter: NSAttributedString = trimOffset < rawAfter.length
+            ? rawAfter.attributedSubstring(from: NSRange(location: trimOffset,
+                                                         length: rawAfter.length - trimOffset))
+            : NSAttributedString()
 
-        let textBefore = String(content.prefix(finalSplitPos))
-        let textAfter = String(content.suffix(content.count - finalSplitPos))
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Preserve "before" portion with full formatting
+        textItem.attributedContent = attrBefore
 
-        textItem.content = textBefore
-
-        // Insert clipboard items
+        // Insert clipboard items after the current text item
         var insertIndex = index + 1
         for item in clipboard {
             entry.items.insert(item, at: insertIndex)
             insertIndex += 1
         }
 
-        // Handle the remaining text
-        if !textAfter.isEmpty {
-            // Check if the last clipboard item is a text item
-            if let lastItem = clipboard.last, case .text = lastItem {
-                // Append to the last pasted text item
-                if insertIndex - 1 < entry.items.count, case .text(let pastedTextItem) = entry.items[insertIndex - 1] {
-                    pastedTextItem.content = pastedTextItem.content + (pastedTextItem.content.isEmpty ? "" : "\n\n") + textAfter
+        // Append the "after" portion, preserving its formatting
+        if attrAfter.length > 0 {
+            if insertIndex - 1 < entry.items.count,
+               case .text(let pastedTextItem) = entry.items[insertIndex - 1] {
+                // Last pasted item is text — merge directly into it
+                let merged = NSMutableAttributedString(attributedString: pastedTextItem.attributedContent)
+                if merged.length > 0 {
+                    merged.append(NSAttributedString(string: "\n\n",
+                        attributes: [.font: bodyFont(), .foregroundColor: NSColor.textColor]))
                 }
+                merged.append(attrAfter)
+                pastedTextItem.attributedContent = merged
             } else {
-                // Add new text item with remaining text
-                entry.addText(textAfter, at: insertIndex)
+                // Last pasted item is media — insert a new text item for the remainder
+                entry.items.insert(.text(TextItem(attributedContent: attrAfter)), at: insertIndex)
             }
         }
 
@@ -1452,7 +1469,9 @@ struct ContentView: View {
         } else {
             // Apply heading
             let font = headingFont(targetFontSize)
-            let style = NSMutableParagraphStyle(); style.paragraphSpacing = 14
+            let style = NSMutableParagraphStyle()
+            style.paragraphSpacingBefore = 14
+            style.paragraphSpacing = 14
             textStorage.addAttribute(.font, value: font, range: paragraphRange)
             textStorage.addAttribute(.paragraphStyle, value: style, range: paragraphRange)
             textView.typingAttributes = [.font: font, .paragraphStyle: style]
@@ -1747,19 +1766,22 @@ struct ContentView: View {
                 itemsBefore.append(.text(after))
             }
 
-            // Merge adjacent text items
-            let textBefore = textBeforeItem?.content ?? ""
-            let textAfter = textAfterItem?.content ?? ""
+            // Merge adjacent text items, preserving attributed formatting
+            let attrBefore = textBeforeItem?.attributedContent ?? NSAttributedString()
+            let attrAfter = textAfterItem?.attributedContent ?? NSAttributedString()
 
-            // Combine text with blank line if both have content
-            let combined: String
+            // Combine attributed strings with blank line if both have content
+            let combinedAttr: NSMutableAttributedString
             let cursorPos: Int
-            if !textBefore.isEmpty && !textAfter.isEmpty {
-                combined = textBefore + "\n\n" + textAfter
-                cursorPos = textBefore.count + 1 // Position at the first newline
+            if !attrBefore.string.isEmpty && !attrAfter.string.isEmpty {
+                combinedAttr = NSMutableAttributedString(attributedString: attrBefore)
+                combinedAttr.append(NSAttributedString(string: "\n\n"))
+                combinedAttr.append(attrAfter)
+                cursorPos = attrBefore.length + 1 // Position at the first newline
             } else {
-                combined = textBefore + textAfter
-                cursorPos = textBefore.count
+                combinedAttr = NSMutableAttributedString(attributedString: attrBefore)
+                combinedAttr.append(attrAfter)
+                cursorPos = attrBefore.length
             }
 
             // Remove the selected item and adjacent text items
@@ -1778,15 +1800,14 @@ struct ContentView: View {
                 entry.removeItem(at: index, registerUndo: false)
             }
 
-            // Add combined text item at the position
-            entry.addText(combined, at: insertIndex)
+            // Insert combined text item at the position, preserving attributed formatting
+            let combinedTextItem = TextItem(attributedContent: combinedAttr)
+            entry.items.insert(.text(combinedTextItem), at: insertIndex)
 
             // Set focus and cursor position
             selectedItemId = nil
-            if case .text(let newTextItem) = entry.items[insertIndex] {
-                focusedTextItemId = newTextItem.id
-                newTextItem.cursorPosition = cursorPos
-            }
+            focusedTextItemId = combinedTextItem.id
+            combinedTextItem.cursorPosition = cursorPos
         case .text:
             break
         }
@@ -1923,7 +1944,7 @@ struct ContentView: View {
 
 }
 
-enum FormattingType: Hashable {
+public enum FormattingType: Hashable {
     case heading1, heading2, heading3
     case bold, italic, underline
     case bulletList, numberedList
@@ -1940,7 +1961,7 @@ struct TextItemView: View {
     let onPaste: () -> Bool
     let onTextViewFocusChanged: (CustomNSTextView?) -> Void
     let onSelectionChanged: () -> Void
-    let onTextDidChange: () -> Void
+    let onTextDidChange: (Character?) -> Void
     var onUndo: (() -> Void)?
     var onRedo: (() -> Void)?
     var onEscapeKey: (() -> Void)?
@@ -1994,7 +2015,7 @@ struct MacTextEditor: NSViewRepresentable {
     let onPaste: () -> Bool
     let onTextViewFocusChanged: (CustomNSTextView?) -> Void
     let onSelectionChanged: () -> Void
-    let onTextDidChange: () -> Void
+    let onTextDidChange: (Character?) -> Void
     var onUndo: (() -> Void)?
     var onRedo: (() -> Void)?
     var onEscapeKey: (() -> Void)?
@@ -2148,7 +2169,15 @@ struct MacTextEditor: NSViewRepresentable {
             }
 
             // Notify about text change (for undo typing grouping — snapshot before model update)
-            parent.onTextDidChange()
+            // Extract the character just typed (char immediately before the cursor)
+            let cursorPos = textView.selectedRange().location
+            var lastTypedChar: Character? = nil
+            if cursorPos > 0 {
+                let str = textStorage.string
+                let charIndex = str.index(str.startIndex, offsetBy: min(cursorPos - 1, str.count - 1))
+                lastTypedChar = str[charIndex]
+            }
+            parent.onTextDidChange(lastTypedChar)
 
             // Update the attributed content (triggers SwiftUI re-render, which calls
             // updateNSView where height is recalculated — no need to do it here too)
@@ -2397,7 +2426,7 @@ class CustomNSTextView: NSTextView {
         let isCmd = event.modifierFlags.contains(.command)
         let isShift = event.modifierFlags.contains(.shift)
 
-        // Handle Cmd-Z (undo) and Cmd-Shift-Z (redo)
+        // Handle Cmd-Z (undo), Cmd-Shift-Z (redo), and Cmd-Y (redo)
         if isCmd && char == "z" {
             if isShift {
                 onRedo?()
@@ -2406,13 +2435,19 @@ class CustomNSTextView: NSTextView {
             }
             return true
         }
+        if isCmd && char == "y" {
+            onRedo?()
+            return true
+        }
 
-        // Check for Cmd-V (paste) — only intercept if our handler actually consumed it
+        // Check for Cmd-V (paste)
         if isCmd && char == "v" {
             if let onPaste = onPaste, onPaste() {
                 return true
             }
-            // onPaste returned false (or wasn't set) — fall through to NSTextView default text paste
+            // Internal paste declined — fall through to paste(_:) which normalises
+            // external content and has a guaranteed NSTextView fallback
+            return super.performKeyEquivalent(with: event)
         }
 
         // B/I/U are handled exclusively by the Format menu (via applyFormattingAction).
@@ -2449,7 +2484,10 @@ class CustomNSTextView: NSTextView {
         let newFont = isAlready ? bodyFont() : headingFont(targetSize)
         let paraStyle: NSParagraphStyle = {
             if isAlready { return .default }
-            let s = NSMutableParagraphStyle(); s.paragraphSpacing = 14; return s
+            let s = NSMutableParagraphStyle()
+            s.paragraphSpacingBefore = 14
+            s.paragraphSpacing = 14
+            return s
         }()
 
         textStorage.beginEditing()
@@ -2537,46 +2575,38 @@ class CustomNSTextView: NSTextView {
         guard let layoutManager = layoutManager,
               let textContainer = textContainer else { return false }
 
-        // Ensure layout is complete
         layoutManager.ensureLayout(for: textContainer)
 
+        let glyphCount = layoutManager.numberOfGlyphs
+        guard glyphCount > 0 else { return true }
+
         let selectedRange = self.selectedRange()
+        guard selectedRange.location != NSNotFound else { return true }
 
-        // Empty text or no selection
-        guard selectedRange.location != NSNotFound,
-              string.count > 0 else { return true }
+        let glyphIndex = min(selectedRange.location, glyphCount - 1)
+        let cursorLineRect = layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+        let firstLineRect  = layoutManager.lineFragmentRect(forGlyphAt: 0, effectiveRange: nil)
 
-        // If at position 0, definitely on first line
-        if selectedRange.location == 0 {
-            return true
-        }
-
-        // Check if there's any newline before the cursor position
-        let textBeforeCursor = (string as NSString).substring(to: selectedRange.location)
-        return !textBeforeCursor.contains("\n")
+        return cursorLineRect.minY <= firstLineRect.minY + 1.0
     }
 
     private func isOnLastLine() -> Bool {
         guard let layoutManager = layoutManager,
               let textContainer = textContainer else { return false }
 
-        // Ensure layout is complete
         layoutManager.ensureLayout(for: textContainer)
 
+        let glyphCount = layoutManager.numberOfGlyphs
+        guard glyphCount > 0 else { return true }
+
         let selectedRange = self.selectedRange()
+        guard selectedRange.location != NSNotFound else { return true }
 
-        // Empty text or no selection
-        guard selectedRange.location != NSNotFound,
-              string.count > 0 else { return true }
+        let glyphIndex    = min(selectedRange.location, glyphCount - 1)
+        let cursorLineRect = layoutManager.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+        let lastLineRect   = layoutManager.lineFragmentRect(forGlyphAt: glyphCount - 1, effectiveRange: nil)
 
-        // If at the very end, definitely on last line
-        if selectedRange.location == string.count {
-            return true
-        }
-
-        // Check if there's any newline after the cursor position
-        let textAfterCursor = (string as NSString).substring(from: selectedRange.location)
-        return !textAfterCursor.contains("\n")
+        return cursorLineRect.minY >= lastLineRect.minY - 1.0
     }
 
     private func handleReturnKey() -> Bool {
@@ -2600,8 +2630,17 @@ class CustomNSTextView: NSTextView {
                         // Insert newline and reset to normal font
                         textStorage.beginEditing()
                         let normalFont = bodyFont()
-                        let newlineAttr = NSAttributedString(string: "\n", attributes: [.font: normalFont])
+                        let newlineAttr = NSAttributedString(string: "\n", attributes: [.font: normalFont, .paragraphStyle: NSParagraphStyle.default])
                         textStorage.insert(newlineAttr, at: selectedRange.location)
+                        // The original heading paragraph terminator shifted forward one position.
+                        // Reset it to body style so it doesn't become a spurious empty heading
+                        // paragraph (which would save as <p></p> and show as a blank line).
+                        let shiftedNl = selectedRange.location + 1
+                        if shiftedNl < textStorage.length,
+                           (textStorage.string as NSString).character(at: shiftedNl) == 10 {
+                            textStorage.addAttribute(.font, value: normalFont, range: NSRange(location: shiftedNl, length: 1))
+                            textStorage.addAttribute(.paragraphStyle, value: NSParagraphStyle.default, range: NSRange(location: shiftedNl, length: 1))
+                        }
                         textStorage.endEditing()
                         self.setSelectedRange(NSRange(location: selectedRange.location + 1, length: 0))
                         // Explicitly reset typing attributes so the next line is body text,
@@ -3031,6 +3070,71 @@ class CustomNSTextView: NSTextView {
 
         return value
     }
+
+    // MARK: - Normalized External Paste
+
+    // Called by NSTextView's paste: action (Cmd-V fallback when internal clipboard declined).
+    // Normalises pasted content to supported attributes only, with guaranteed fallbacks.
+    override func paste(_ sender: Any?) {
+        let pasteboard = NSPasteboard.general
+
+        if let data = pasteboard.data(forType: .rtf),
+           let parsed = try? NSAttributedString(
+               data: data,
+               options: [.documentType: NSAttributedString.DocumentType.rtf],
+               documentAttributes: nil) {
+            self.insertText(normalizeForPaste(parsed), replacementRange: self.selectedRange())
+            return
+        }
+        if let data = pasteboard.data(forType: .rtfd),
+           let parsed = try? NSAttributedString(
+               data: data,
+               options: [.documentType: NSAttributedString.DocumentType.rtfd],
+               documentAttributes: nil) {
+            self.insertText(normalizeForPaste(parsed), replacementRange: self.selectedRange())
+            return
+        }
+        if let str = pasteboard.string(forType: .string), !str.isEmpty {
+            self.insertText(
+                NSAttributedString(string: str, attributes: [.font: bodyFont(), .foregroundColor: NSColor.textColor]),
+                replacementRange: self.selectedRange())
+            return
+        }
+        // Final fallback: let NSTextView handle it natively
+        super.paste(sender)
+    }
+
+    // Strip all attributes except bold, italic, and underline.
+    // Font family and size are reset to the app's body font.
+    private func normalizeForPaste(_ input: NSAttributedString) -> NSAttributedString {
+        let result = NSMutableAttributedString(attributedString: input)
+
+        // Wipe everything — will selectively restore below
+        result.setAttributes(
+            [.font: bodyFont(), .foregroundColor: NSColor.textColor],
+            range: NSRange(location: 0, length: result.length)
+        )
+
+        input.enumerateAttributes(
+            in: NSRange(location: 0, length: input.length), options: []
+        ) { attrs, range, _ in
+            let sourceFont = attrs[.font] as? NSFont ?? bodyFont()
+            let traits = NSFontManager.shared.traits(of: sourceFont)
+            let isBold   = traits.contains(.boldFontMask)
+            let isItalic = traits.contains(.italicFontMask)
+
+            var font = bodyFont()
+            if isBold   { font = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask) }
+            if isItalic { font = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask) }
+            result.addAttribute(.font, value: font, range: range)
+
+            if let underline = attrs[.underlineStyle] {
+                result.addAttribute(.underlineStyle, value: underline, range: range)
+            }
+        }
+
+        return result
+    }
 }
 
 // Entry content view extracted to avoid compiler complexity issues
@@ -3055,7 +3159,7 @@ struct EntryContentView: View {
     let onTextViewFocusChanged: (CustomNSTextView?) -> Void
     let onSelectionChanged: () -> Void
     let onImageURLsDrop: ([URL], Int, Int?) -> Void
-    let onTextDidChange: () -> Void
+    let onTextDidChange: (Character?) -> Void
     var onUndo: (() -> Void)?
     var onRedo: (() -> Void)?
     @State private var dropTargetIndex: Int? = nil
@@ -3684,7 +3788,7 @@ class CutPasteHandlingView: NSView {
         let isCmd = event.modifierFlags.contains(.command)
         let isShift = event.modifierFlags.contains(.shift)
 
-        // Handle Cmd-Z (undo) and Cmd-Shift-Z (redo)
+        // Handle Cmd-Z (undo), Cmd-Shift-Z (redo), and Cmd-Y (redo)
         if isCmd && char == "z" {
             if isShift && canRedo {
                 onRedo?()
@@ -3693,6 +3797,10 @@ class CutPasteHandlingView: NSView {
                 onUndo?()
                 return true
             }
+        }
+        if isCmd && char == "y" && canRedo {
+            onRedo?()
+            return true
         }
 
         // Only handle cut/paste, let other shortcuts pass through

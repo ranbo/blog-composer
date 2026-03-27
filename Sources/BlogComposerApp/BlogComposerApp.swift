@@ -2,90 +2,7 @@
 
 import SwiftUI
 import AppKit
-
-// Focused value keys for undo/redo state
-struct UndoCoordinatorKey: FocusedValueKey {
-    typealias Value = UndoCoordinator
-}
-
-struct UndoActionKey: FocusedValueKey {
-    typealias Value = () -> Void
-}
-
-struct RedoActionKey: FocusedValueKey {
-    typealias Value = () -> Void
-}
-
-struct SyncActionKey: FocusedValueKey {
-    typealias Value = () -> Void
-}
-
-struct RegenerateIndexActionKey: FocusedValueKey {
-    typealias Value = () -> Void
-}
-
-struct ApplyFormattingKey: FocusedValueKey {
-    typealias Value = (FormattingType) -> Void
-}
-
-struct FindActionKey: FocusedValueKey {
-    typealias Value = () -> Void
-}
-
-struct FindNextActionKey: FocusedValueKey {
-    typealias Value = () -> Void
-}
-
-struct FindPreviousActionKey: FocusedValueKey {
-    typealias Value = () -> Void
-}
-
-struct NewEntryActionKey: FocusedValueKey {
-    typealias Value = () -> Void
-}
-
-extension FocusedValues {
-    var undoCoordinator: UndoCoordinator? {
-        get { self[UndoCoordinatorKey.self] }
-        set { self[UndoCoordinatorKey.self] = newValue }
-    }
-    var undoAction: (() -> Void)? {
-        get { self[UndoActionKey.self] }
-        set { self[UndoActionKey.self] = newValue }
-    }
-    var redoAction: (() -> Void)? {
-        get { self[RedoActionKey.self] }
-        set { self[RedoActionKey.self] = newValue }
-    }
-    var syncAction: (() -> Void)? {
-        get { self[SyncActionKey.self] }
-        set { self[SyncActionKey.self] = newValue }
-    }
-    var regenerateIndexAction: (() -> Void)? {
-        get { self[RegenerateIndexActionKey.self] }
-        set { self[RegenerateIndexActionKey.self] = newValue }
-    }
-    var applyFormattingAction: ((FormattingType) -> Void)? {
-        get { self[ApplyFormattingKey.self] }
-        set { self[ApplyFormattingKey.self] = newValue }
-    }
-    var findAction: (() -> Void)? {
-        get { self[FindActionKey.self] }
-        set { self[FindActionKey.self] = newValue }
-    }
-    var findNextAction: (() -> Void)? {
-        get { self[FindNextActionKey.self] }
-        set { self[FindNextActionKey.self] = newValue }
-    }
-    var findPreviousAction: (() -> Void)? {
-        get { self[FindPreviousActionKey.self] }
-        set { self[FindPreviousActionKey.self] = newValue }
-    }
-    var newEntryAction: (() -> Void)? {
-        get { self[NewEntryActionKey.self] }
-        set { self[NewEntryActionKey.self] = newValue }
-    }
-}
+import BlogComposerCore
 
 @main
 struct BlogComposerApp: App {
@@ -100,6 +17,7 @@ struct BlogComposerApp: App {
     @FocusedValue(\.findNextAction) var findNextAction
     @FocusedValue(\.findPreviousAction) var findPreviousAction
     @FocusedValue(\.newEntryAction) var newEntryAction
+    @FocusedValue(\.saveAction) var saveAction
 
     var body: some Scene {
         WindowGroup {
@@ -121,6 +39,12 @@ struct BlogComposerApp: App {
                     redoAction?()
                 }
                 .keyboardShortcut("z", modifiers: [.command, .shift])
+                .disabled(undoCoordinator?.canRedo != true)
+
+                Button("Redo \(undoCoordinator?.redoActionName ?? "")") {
+                    redoAction?()
+                }
+                .keyboardShortcut("y", modifiers: .command)
                 .disabled(undoCoordinator?.canRedo != true)
             }
             CommandGroup(after: .pasteboard) {
@@ -148,6 +72,13 @@ struct BlogComposerApp: App {
                 }
                 .keyboardShortcut("n", modifiers: .command)
                 .disabled(newEntryAction == nil)
+            }
+            CommandGroup(replacing: .saveItem) {
+                Button("Save") {
+                    saveAction?()
+                }
+                .keyboardShortcut("s", modifiers: .command)
+                .disabled(saveAction == nil)
             }
             CommandMenu("Publish") {
                 Button("Regenerate Article Index") {
