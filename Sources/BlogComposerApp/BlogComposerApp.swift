@@ -13,6 +13,7 @@ struct BlogComposerApp: App {
     @FocusedValue(\.syncAction) var syncAction
     @FocusedValue(\.regenerateIndexAction) var regenerateIndexAction
     @FocusedValue(\.applyFormattingAction) var applyFormattingAction
+    @FocusedValue(\.insertHyperlinkAction) var insertHyperlinkAction
     @FocusedValue(\.findAction) var findAction
     @FocusedValue(\.findNextAction) var findNextAction
     @FocusedValue(\.findPreviousAction) var findPreviousAction
@@ -137,6 +138,14 @@ struct BlogComposerApp: App {
                 }
                 .keyboardShortcut("u", modifiers: .command)
                 .disabled(applyFormattingAction == nil)
+
+                Divider()
+
+                Button("Hyperlink…") {
+                    insertHyperlinkAction?()
+                }
+                .keyboardShortcut("k", modifiers: .command)
+                .disabled(insertHyperlinkAction == nil)
             }
         }
     }

@@ -15,7 +15,8 @@ let package = Package(
     targets: [
         .target(
             name: "BlogComposerCore",
-            path: "Sources/BlogComposerCore"
+            path: "Sources/BlogComposerCore",
+            resources: [.process("Resources")]
         ),
         .executableTarget(
             name: "BlogComposer",

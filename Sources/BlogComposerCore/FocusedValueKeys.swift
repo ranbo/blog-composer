@@ -47,6 +47,10 @@ struct SaveActionKey: FocusedValueKey {
     typealias Value = () -> Void
 }
 
+struct InsertHyperlinkKey: FocusedValueKey {
+    typealias Value = () -> Void
+}
+
 public extension FocusedValues {
     var undoCoordinator: UndoCoordinator? {
         get { self[UndoCoordinatorKey.self] }
@@ -91,5 +95,9 @@ public extension FocusedValues {
     var saveAction: (() -> Void)? {
         get { self[SaveActionKey.self] }
         set { self[SaveActionKey.self] = newValue }
+    }
+    var insertHyperlinkAction: (() -> Void)? {
+        get { self[InsertHyperlinkKey.self] }
+        set { self[InsertHyperlinkKey.self] = newValue }
     }
 }

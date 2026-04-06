@@ -400,6 +400,17 @@ class HTMLParser {
                     result.append(applyItalic(childContent))
                 case "u":
                     result.append(applyUnderline(childContent))
+                case "a":
+                    if let href = childElement.attribute(forName: "href")?.stringValue,
+                       !href.isEmpty,
+                       let url = URL(string: href) {
+                        let linked = NSMutableAttributedString(attributedString: childContent)
+                        let fullRange = NSRange(location: 0, length: linked.length)
+                        linked.addAttribute(.link, value: url, range: fullRange)
+                        result.append(linked)
+                    } else {
+                        result.append(childContent)
+                    }
                 default:
                     result.append(childContent)
                 }

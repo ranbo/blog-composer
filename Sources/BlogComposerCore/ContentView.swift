@@ -150,6 +150,11 @@ public struct ContentView: View {
     @State private var showVideoDialog = false
     @State private var pendingVideoDropIndex: Int = 0
     @State private var pendingVideoCursorPosition: Int? = nil
+    @State private var showHyperlinkDialog = false
+    @State private var hyperlinkDialogURL = ""
+    @State private var hyperlinkDialogText = ""
+    @State private var hyperlinkDialogRange = NSRange(location: 0, length: 0)
+    @State private var hyperlinkDialogHasExisting = false
     @State private var selectedItemId: UUID? = nil
     @State private var captionEditingId: UUID? = nil
     @State private var focusedTextItemId: UUID? = nil
@@ -446,6 +451,7 @@ public struct ContentView: View {
             .focusedValue(\.findPreviousAction, findPrevious)
             .focusedValue(\.newEntryAction, createNewArticle)
             .focusedValue(\.saveAction, { saveEntry(isManualSave: true) })
+            .focusedValue(\.insertHyperlinkAction, showHyperlinkSheet)
     }
 
     private var mediaCount: Int {
@@ -470,6 +476,19 @@ public struct ContentView: View {
         }
         .frame(minWidth: 900, minHeight: 600)
         .environmentObject(findRegistry)
+        .sheet(isPresented: $showHyperlinkDialog) {
+            HyperlinkDialogView(
+                initialURL: hyperlinkDialogURL,
+                initialText: hyperlinkDialogText,
+                hasExistingLink: hyperlinkDialogHasExisting,
+                onApply: { url, text in
+                    applyHyperlink(url: url, text: text)
+                },
+                onRemove: {
+                    removeHyperlink()
+                }
+            )
+        }
         .sheet(isPresented: $showVideoDialog) {
             VideoDialogView(onAdd: { url, title in
                 entry.insertVideo(url: url, title: title,
@@ -1426,6 +1445,114 @@ public struct ContentView: View {
         }
     }
 
+    private func showHyperlinkSheet() {
+        guard let textView = focusedTextView,
+              let textStorage = textView.textStorage else { return }
+
+        let selection = textView.selectedRange()
+        let length = textStorage.length
+
+        if length == 0 {
+            hyperlinkDialogURL = ""
+            hyperlinkDialogText = ""
+            hyperlinkDialogRange = NSRange(location: 0, length: 0)
+            hyperlinkDialogHasExisting = false
+            showHyperlinkDialog = true
+            return
+        }
+
+        // Check for a link attribute at or around the cursor/selection
+        let checkPos = min(selection.location, length - 1)
+        var effectiveRange = NSRange()
+        let linkAttr = textStorage.attribute(.link, at: checkPos,
+                                             longestEffectiveRange: &effectiveRange,
+                                             in: NSRange(location: 0, length: length))
+
+        if let linkAttr = linkAttr {
+            let urlString: String
+            if let url = linkAttr as? URL {
+                urlString = url.absoluteString
+            } else if let str = linkAttr as? String {
+                urlString = str
+            } else {
+                urlString = ""
+            }
+            hyperlinkDialogURL = urlString
+            hyperlinkDialogText = (textStorage.string as NSString).substring(with: effectiveRange)
+            hyperlinkDialogRange = effectiveRange
+            hyperlinkDialogHasExisting = true
+        } else if selection.length > 0 {
+            hyperlinkDialogURL = ""
+            hyperlinkDialogText = (textStorage.string as NSString).substring(with: selection)
+            hyperlinkDialogRange = selection
+            hyperlinkDialogHasExisting = false
+        } else {
+            hyperlinkDialogURL = ""
+            hyperlinkDialogText = ""
+            hyperlinkDialogRange = NSRange(location: selection.location, length: 0)
+            hyperlinkDialogHasExisting = false
+        }
+
+        showHyperlinkDialog = true
+    }
+
+    private func applyHyperlink(url: String, text: String) {
+        guard let textView = focusedTextView,
+              let textStorage = textView.textStorage else { return }
+
+        undoCoordinator.commitTypingIfNeeded(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+        undoCoordinator.takeSnapshot(entry: entry, actionName: "Hyperlink", focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+
+        let trimmedURL = url.trimmingCharacters(in: .whitespaces)
+        guard !trimmedURL.isEmpty, let linkURL = URL(string: trimmedURL) else {
+            removeHyperlink()
+            return
+        }
+
+        let range = hyperlinkDialogRange
+        let linkAttrs: [NSAttributedString.Key: Any] = [
+            .font: bodyFont(),
+            .link: linkURL
+        ]
+
+        textStorage.beginEditing()
+        if range.length == 0 && !text.isEmpty {
+            // Insert new linked text at cursor
+            textStorage.replaceCharacters(in: range, with: NSAttributedString(string: text, attributes: linkAttrs))
+        } else if range.length > 0 {
+            let currentText = (textStorage.string as NSString).substring(with: range)
+            if text != currentText {
+                // Replace text and apply link
+                textStorage.replaceCharacters(in: range, with: NSAttributedString(string: text, attributes: linkAttrs))
+            } else {
+                // Just update the link attribute
+                textStorage.addAttribute(.link, value: linkURL, range: range)
+            }
+        }
+        textStorage.endEditing()
+
+        textView.didChangeText()
+        undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+    }
+
+    private func removeHyperlink() {
+        guard let textView = focusedTextView,
+              let textStorage = textView.textStorage else { return }
+
+        let range = hyperlinkDialogRange
+        guard range.length > 0 else { return }
+
+        undoCoordinator.commitTypingIfNeeded(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+        undoCoordinator.takeSnapshot(entry: entry, actionName: "Remove Hyperlink", focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+
+        textStorage.beginEditing()
+        textStorage.removeAttribute(.link, range: range)
+        textStorage.endEditing()
+
+        textView.didChangeText()
+        undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+    }
+
     private func applyHeading(textView: NSTextView, savedRange: NSRange, level: Int) {
         guard let textStorage = textView.textStorage else { return }
 
@@ -2046,6 +2173,11 @@ struct MacTextEditor: NSViewRepresentable {
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticSpellingCorrectionEnabled = false
         textView.isContinuousSpellCheckingEnabled = true
+        textView.linkTextAttributes = [
+            .foregroundColor: NSColor.linkColor,
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+            .cursor: NSCursor.pointingHand
+        ]
 
         // Disable undo to avoid crashes (will implement properly later)
         textView.allowsUndo = false
@@ -3815,6 +3947,61 @@ class CutPasteHandlingView: NSView {
 
         // Don't intercept formatting shortcuts - let them pass through to text view
         return super.performKeyEquivalent(with: event)
+    }
+}
+
+struct HyperlinkDialogView: View {
+    @Environment(\.dismiss) var dismiss
+    @State private var url: String
+    @State private var text: String
+    let hasExistingLink: Bool
+    let onApply: (String, String) -> Void
+    let onRemove: () -> Void
+
+    init(initialURL: String, initialText: String, hasExistingLink: Bool,
+         onApply: @escaping (String, String) -> Void, onRemove: @escaping () -> Void) {
+        _url = State(initialValue: initialURL)
+        _text = State(initialValue: initialText)
+        self.hasExistingLink = hasExistingLink
+        self.onApply = onApply
+        self.onRemove = onRemove
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("Hyperlink")
+                .font(.headline)
+
+            TextField("URL", text: $url)
+                .textFieldStyle(.roundedBorder)
+
+            TextField("Link text", text: $text)
+                .textFieldStyle(.roundedBorder)
+
+            HStack {
+                Button("Cancel") {
+                    dismiss()
+                }
+
+                if hasExistingLink {
+                    Button("Remove") {
+                        onRemove()
+                        dismiss()
+                    }
+                }
+
+                Spacer()
+
+                Button("OK") {
+                    onApply(url, text)
+                    dismiss()
+                }
+                .disabled(url.trimmingCharacters(in: .whitespaces).isEmpty)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding()
+        .frame(width: 400)
     }
 }
 

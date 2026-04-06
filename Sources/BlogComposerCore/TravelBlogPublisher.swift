@@ -769,6 +769,16 @@ public class TravelBlogPublisher {
         if !FileManager.default.fileExists(atPath: jsURL.path) {
             try lightboxJS.write(to: jsURL, atomically: true, encoding: .utf8)
         }
+
+        // Deploy blog.css from the app bundle — always overwrite so CSS changes
+        // in the repo propagate to disk on the next publish.
+        if let bundledCSS = Bundle.module.url(forResource: "blog", withExtension: "css") {
+            let destCSS = travelBlogDir.appendingPathComponent("blog.css")
+            if FileManager.default.fileExists(atPath: destCSS.path) {
+                try FileManager.default.removeItem(at: destCSS)
+            }
+            try FileManager.default.copyItem(at: bundledCSS, to: destCSS)
+        }
     }
 
     // MARK: - Helpers

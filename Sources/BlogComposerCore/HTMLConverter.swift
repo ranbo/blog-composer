@@ -179,12 +179,23 @@ class HTMLConverter {
                 continue
             }
 
-            // Check if this line is a list item
+            // Check if this line is a list item — headings are never list items even if
+            // their text starts with a number (e.g. "1. Introduction" as H2).
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            let isList = trimmed.hasPrefix("• ") ||
-                         trimmed.range(of: "^\\d+\\. ", options: .regularExpression) != nil ||
-                         trimmed.range(of: "^[a-z]\\) ", options: .regularExpression) != nil ||
-                         trimmed.range(of: "^[ivx]+\\. ", options: .regularExpression) != nil
+            let isHeadingFont: Bool = {
+                guard lineLength > 0, currentPosition < attributedText.length else { return false }
+                let attrs = attributedText.attributes(at: currentPosition, effectiveRange: nil)
+                if let font = attrs[.font] as? NSFont {
+                    return font.pointSize > kBodyFontSize
+                }
+                return false
+            }()
+            let isList = !isHeadingFont && (
+                trimmed.hasPrefix("• ") ||
+                trimmed.range(of: "^\\d+\\. ", options: .regularExpression) != nil ||
+                trimmed.range(of: "^[a-z]\\) ", options: .regularExpression) != nil ||
+                trimmed.range(of: "^[ivx]+\\. ", options: .regularExpression) != nil
+            )
 
             if isList {
                 // Gather consecutive list items
@@ -403,9 +414,13 @@ class HTMLConverter {
             let substring = (attributedText.string as NSString).substring(with: effectiveRange)
             var formatted = escapeHTML(substring)
 
-            // Check for underline (innermost)
-            if let underlineStyle = attrs[.underlineStyle] as? Int, underlineStyle > 0 {
-                formatted = "<u>\(formatted)</u>"
+            let isLink = attrs[.link] != nil
+
+            // Check for underline (innermost) — skip for links (underline is purely visual)
+            if !isLink {
+                if let underlineStyle = attrs[.underlineStyle] as? Int, underlineStyle > 0 {
+                    formatted = "<u>\(formatted)</u>"
+                }
             }
 
             // Check for bold and italic
@@ -421,6 +436,13 @@ class HTMLConverter {
                 if traits.contains(.bold) && !isHeading {
                     formatted = "<b>\(formatted)</b>"
                 }
+            }
+
+            // Check for link (outermost)
+            if let linkURL = attrs[.link] as? URL {
+                formatted = "<a href=\"\(escapeHTML(linkURL.absoluteString))\">\(formatted)</a>"
+            } else if let linkString = attrs[.link] as? String, !linkString.isEmpty {
+                formatted = "<a href=\"\(escapeHTML(linkString))\">\(formatted)</a>"
             }
 
             html += formatted
