@@ -197,12 +197,20 @@ class BlogEntry: ObservableObject {
             if isTextItem(item) && i < items.count - 1 && isTextItem(items[i + 1]) {
                 // Merge the two text items
                 if case .text(let textItem1) = item, case .text(let textItem2) = items[i + 1] {
-                    let mergedContent = textItem1.content.isEmpty && textItem2.content.isEmpty ? "" :
-                                       textItem1.content.isEmpty ? textItem2.content :
-                                       textItem2.content.isEmpty ? textItem1.content :
-                                       textItem1.content + "\n\n" + textItem2.content
-                    let mergedItem = TextItem(content: mergedContent)
-                    newItems.append(.text(mergedItem))
+                    let a1 = textItem1.attributedContent
+                    let a2 = textItem2.attributedContent
+                    let merged: NSAttributedString
+                    if a1.length == 0 {
+                        merged = a2
+                    } else if a2.length == 0 {
+                        merged = a1
+                    } else {
+                        let m = NSMutableAttributedString(attributedString: a1)
+                        m.append(NSAttributedString(string: "\n\n", attributes: [.font: bodyFont()]))
+                        m.append(a2)
+                        merged = m
+                    }
+                    newItems.append(.text(TextItem(attributedContent: merged)))
                     i += 2  // Skip both items
                     continue
                 }
@@ -334,7 +342,8 @@ class BlogEntry: ObservableObject {
             if existingIdx < items.count, case .text(let existing) = items[existingIdx] {
                 let combined = NSMutableAttributedString(attributedString: attrAfter)
                 if !existing.attributedContent.string.isEmpty {
-                    combined.append(NSAttributedString(string: "\n"))
+                    combined.append(NSAttributedString(string: "\n",
+                        attributes: [.font: bodyFont(), .foregroundColor: NSColor.textColor]))
                     combined.append(existing.attributedContent)
                 }
                 existing.attributedContent = combined
@@ -386,7 +395,8 @@ class BlogEntry: ObservableObject {
                 if existingTextIndex < items.count, case .text(let existingTextItem) = items[existingTextIndex] {
                     let combined = NSMutableAttributedString(attributedString: attrAfter)
                     if !existingTextItem.attributedContent.string.isEmpty {
-                        combined.append(NSAttributedString(string: "\n"))
+                        combined.append(NSAttributedString(string: "\n",
+                            attributes: [.font: bodyFont(), .foregroundColor: NSColor.textColor]))
                         combined.append(existingTextItem.attributedContent)
                     }
                     existingTextItem.attributedContent = combined

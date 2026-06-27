@@ -21,6 +21,17 @@ class HTMLConverter {
             }
         }
 
+        // Resolve the relative path to shared assets (blog.css, util/).
+        // Published articles live in TravelBlog/<slug>/ so assets are one level up ("../").
+        // Draft articles live in Drafts/<slug>/ — they must reach across into TravelBlog/.
+        let assetPrefix: String = {
+            guard let filePath = entry.filePath else { return "../" }
+            let parentName = filePath.deletingLastPathComponent()   // <slug>/
+                                     .deletingLastPathComponent()   // Drafts/ or TravelBlog/
+                                     .lastPathComponent
+            return parentName == "Drafts" ? "../../TravelBlog/" : "../"
+        }()
+
         var html = """
         <!DOCTYPE html>
         <html>
@@ -28,8 +39,8 @@ class HTMLConverter {
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1">
           <title>\(escapeHTML(entry.title))</title>
-          <link rel="stylesheet" href="../util/lightbox.css">
-          <link rel="stylesheet" href="../blog.css">
+          <link rel="stylesheet" href="\(assetPrefix)util/lightbox.css">
+          <link rel="stylesheet" href="\(assetPrefix)blog.css">
         </head>
         <body>
 
@@ -90,17 +101,20 @@ class HTMLConverter {
             case .image(let imageItem):
                 if let filename = imageMap[imageItem.id] {
                     let baseFilename = (filename as NSString).deletingPathExtension
+                    // URL-encode path components so chars like '#' are safe in href/src;
+                    // then HTML-escape the result so '&' becomes '&amp;' in the attribute.
+                    let urlBase = escapeHTML(urlEncodePath(baseFilename))
                     let caption = imageItem.caption?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     if !caption.isEmpty {
                         let captionHTML = escapeHTML(caption).replacingOccurrences(of: "\n", with: "<br>")
                         html += "  <table class=\"tr-caption-container\" style=\"margin: auto;\"><tbody><tr>\n"
-                        html += "    <td style=\"text-align: center;\"><a href=\"web/\(escapeHTML(baseFilename)).jpg\" class=\"lightbox-link\"><img src=\"small/\(escapeHTML(baseFilename)).jpg\" loading=\"lazy\" alt=\"\(escapeHTML(baseFilename))\"></a></td>\n"
+                        html += "    <td style=\"text-align: center;\"><a href=\"web/\(urlBase).jpg\" class=\"lightbox-link\"><img src=\"small/\(urlBase).jpg\" loading=\"lazy\" alt=\"\(escapeHTML(baseFilename))\"></a></td>\n"
                         html += "  </tr><tr>\n"
                         html += "    <td class=\"tr-caption\" style=\"text-align: center;\">\(captionHTML)</td>\n"
                         html += "  </tr></tbody></table>\n\n"
                     } else {
                         html += """
-                          <a href="web/\(escapeHTML(baseFilename)).jpg" class="lightbox-link"><img src="small/\(escapeHTML(baseFilename)).jpg" loading="lazy" alt="\(escapeHTML(baseFilename))"></a>
+                          <a href="web/\(urlBase).jpg" class="lightbox-link" style="display: block; text-align: center;"><img src="small/\(urlBase).jpg" loading="lazy" alt="\(escapeHTML(baseFilename))"></a>
 
                         """
                     }
@@ -142,7 +156,7 @@ class HTMLConverter {
           });
         }
         </script>
-        <script src="../util/lightbox.js"></script>
+        <script src="\(assetPrefix)util/lightbox.js"></script>
         </body>
         </html>
         """
@@ -483,6 +497,14 @@ class HTMLConverter {
     // entities.  Keeping the file ASCII-only means libxml2's encoding detection
     // (which defaults to Windows-1252 for HTML) can never corrupt curly quotes,
     // em-dashes, or other multi-byte UTF-8 sequences on reload.
+    /// Percent-encodes a filename for use as a URL path component.
+    /// Characters safe in URL paths (letters, digits, `-._~!$'()*+,;=:@`) are left alone;
+    /// everything else (notably `#`, `?`, `%`, `[`, `]`, `&`, space) is encoded.
+    /// Call escapeHTML() on the result before embedding in an HTML attribute.
+    private static func urlEncodePath(_ s: String) -> String {
+        s.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? s
+    }
+
     private static func escapeHTML(_ text: String) -> String {
         var result = ""
         result.reserveCapacity(text.unicodeScalars.count)

@@ -162,6 +162,8 @@ public struct ContentView: View {
     @State private var selectedItemIds: Set<UUID> = []
     @State private var clipboard: [EntryItem] = []
     @State private var clipboardPasteboardCount: Int = -1 // NSPasteboard changeCount when clipboard was last populated
+    @State private var selectionAnchorId: UUID? = nil     // anchor item for shift-click range selection
+    @State private var clipboardSourceBaseURL: URL? = nil // article folder items were cut/copied from
     @State private var focusedTextView: CustomNSTextView? = nil
     @State private var activeFormats: Set<FormattingType> = []
     @StateObject private var articleManager = ArticleManager()
@@ -179,6 +181,11 @@ public struct ContentView: View {
     // Publish state
     enum PublishState { case idle, publishing, success(URL), failure(String) }
     @State private var publishState: PublishState = .idle
+
+    // Email draft state
+    enum EmailDraftState { case idle, uploading, success, failure(String) }
+    @State private var emailDraftState: EmailDraftState = .idle
+    @State private var showGmailSetup = false
     @State private var articleDate = Date()
     @State private var gcsBucket: String = UserDefaults.standard.string(forKey: "GCSBucket") ?? ""
     @State private var showSyncError = false
@@ -291,6 +298,23 @@ public struct ContentView: View {
                         previewEntry()
                     }
 
+                    // Email draft button
+                    Group {
+                        if case .uploading = emailDraftState {
+                            HStack(spacing: 4) {
+                                ProgressView().controlSize(.small)
+                                Text("Emailing…").foregroundColor(.secondary)
+                            }
+                        } else if case .success = emailDraftState {
+                            Button("Emailed ✓") {}
+                                .foregroundColor(.green)
+                        } else {
+                            Button("Email Draft") {
+                                Task { await emailDraft() }
+                            }
+                        }
+                    }
+
                     // Publish / Update button
                     Group {
                         if case .publishing = publishState {
@@ -399,6 +423,7 @@ public struct ContentView: View {
                     } else {
                         selectedItemId = nil
                         selectedItemIds.removeAll()
+                        selectionAnchorId = nil
                     }
                 },
                 onUpdateCaption: updateImageCaption,
@@ -517,12 +542,30 @@ public struct ContentView: View {
                 recentFiles: syncProgressFiles
             )
         }
+        .sheet(isPresented: $showGmailSetup) {
+            GmailSetupView {
+                Task { await emailDraft() }
+            }
+        }
+        .alert("Email Draft Failed", isPresented: Binding(
+            get: { if case .failure = emailDraftState { return true } else { return false } },
+            set: { if !$0 { emailDraftState = .idle } }
+        )) {
+            Button("OK") { emailDraftState = .idle }
+        } message: {
+            if case .failure(let msg) = emailDraftState { Text(msg) }
+        }
+        .onChange(of: entry.isDirty) { _, isDirty in
+            if isDirty, case .success = emailDraftState { emailDraftState = .idle }
+        }
         .background(CutPasteHandler(
             canCut: canCut(),
+            canCopy: canCopy(),
             canPaste: canPaste(),
             canUndo: undoCoordinator.canUndo,
             canRedo: undoCoordinator.canRedo,
             onCut: handleCut,
+            onCopy: handleCopy,
             onPaste: { _ = handlePaste() },
             onUndo: performUndo,
             onRedo: performRedo
@@ -622,6 +665,14 @@ public struct ContentView: View {
                 publishState = .idle
             }
         }
+        .onChange(of: focusedTextItemId) { _, newId in
+            // Plain click in a text view: set it as the range anchor and clear any range selection.
+            if let newId = newId {
+                selectionAnchorId = newId
+                selectedItemIds.removeAll()
+                selectedItemId = nil
+            }
+        }
     }
 
     private func handleDrop(providers: [NSItemProvider]) {
@@ -707,6 +758,35 @@ public struct ContentView: View {
                     undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
                 }
             }
+        }
+    }
+
+    private func emailDraft() async {
+        guard let credentials = KeychainHelper.load() else {
+            showGmailSetup = true
+            return
+        }
+        emailDraftState = .uploading
+
+        var imageMap: [UUID: String] = [:]
+        for item in entry.items {
+            if case .image(let img) = item { imageMap[img.id] = img.filename }
+        }
+
+        let htmlBody    = EmailComposer.buildEmailHTML(entry: entry, imageMap: imageMap)
+        let attachments = EmailComposer.buildAttachments(entry: entry, imageMap: imageMap)
+        let emlData     = EmailComposer.buildMIMEMessage(
+            from: credentials.email,
+            subject: entry.title.isEmpty ? "(no subject)" : entry.title,
+            htmlBody: htmlBody,
+            attachments: attachments
+        )
+
+        do {
+            try await GmailDraftUploader.upload(emlData: emlData, credentials: credentials)
+            emailDraftState = .success
+        } catch {
+            emailDraftState = .failure(error.localizedDescription)
         }
     }
 
@@ -1161,6 +1241,7 @@ public struct ContentView: View {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(cutText.isEmpty ? " " : cutText, forType: .string)
         clipboardPasteboardCount = NSPasteboard.general.changeCount
+        clipboardSourceBaseURL = entry.filePath?.deletingLastPathComponent()
 
         // Find text items before first and after last cut item
         let firstIndex = indicesToCut.first!
@@ -1182,7 +1263,8 @@ public struct ContentView: View {
             switch (attrBefore, attrAfter) {
             case (let b?, let a?):
                 let m = NSMutableAttributedString(attributedString: b)
-                m.append(NSAttributedString(string: "\n\n"))
+                m.append(NSAttributedString(string: "\n\n",
+                    attributes: [.font: bodyFont(), .foregroundColor: NSColor.textColor]))
                 m.append(a)
                 return m
             case (let b?, nil): return b
@@ -1207,13 +1289,73 @@ public struct ContentView: View {
 
         // Insert combined text item, preserving attributed formatting
         let insertIndex = toRemove.min()!
-        entry.items.insert(.text(TextItem(attributedContent: combinedAttr)), at: insertIndex)
+        let mergedItem = TextItem(attributedContent: combinedAttr)
+        // Position cursor at the join point — end of the "before" portion
+        mergedItem.currentCursorPosition = attrBefore?.length ?? 0
+        mergedItem.cursorPosition = mergedItem.currentCursorPosition
+        entry.items.insert(.text(mergedItem), at: insertIndex)
 
-        // Clear selection
+        // Focus the merged item at the join point so paste lands in the right place
+        focusedTextItemId = mergedItem.id
         selectedItemId = nil
         selectedItemIds.removeAll()
 
         undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+    }
+
+    private func canCopy() -> Bool {
+        return !selectedItemIds.isEmpty || selectedItemId != nil
+    }
+
+    private func handleCopy() {
+        let ids: [UUID]
+        if !selectedItemIds.isEmpty {
+            ids = Array(selectedItemIds)
+        } else if let sid = selectedItemId {
+            ids = [sid]
+        } else {
+            return
+        }
+
+        var indices: [Int] = []
+        for id in ids {
+            if let i = entry.items.firstIndex(where: { $0.id == id }) { indices.append(i) }
+        }
+        guard !indices.isEmpty else { return }
+        indices.sort()
+
+        clipboard = indices.map { entry.items[$0] }
+        clipboardSourceBaseURL = entry.filePath?.deletingLastPathComponent()
+
+        let text = clipboard.compactMap { item -> String? in
+            guard case .text(let t) = item, !t.content.isEmpty else { return nil }
+            return t.content
+        }.joined(separator: "\n\n")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text.isEmpty ? " " : text, forType: .string)
+        clipboardPasteboardCount = NSPasteboard.general.changeCount
+    }
+
+    // Copies full/ and small/ image files from the clipboard source article to the current
+    // article's folder when pasting across blog posts.
+    private func ensureImagesInCurrentArticle() {
+        guard let destBase = entry.filePath?.deletingLastPathComponent(),
+              let srcBase = clipboardSourceBaseURL,
+              destBase.standardized != srcBase.standardized else { return }
+
+        let fm = FileManager.default
+        for item in clipboard {
+            guard case .image(let img) = item else { continue }
+            let base = (img.filename as NSString).deletingPathExtension
+
+            for (subdir, name) in [("full", img.filename), ("small", "\(base).jpg")] {
+                let src  = srcBase.appendingPathComponent(subdir).appendingPathComponent(name)
+                let dest = destBase.appendingPathComponent(subdir).appendingPathComponent(name)
+                guard fm.fileExists(atPath: src.path), !fm.fileExists(atPath: dest.path) else { continue }
+                try? fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try? fm.copyItem(at: src, to: dest)
+            }
+        }
     }
 
     @discardableResult
@@ -1223,6 +1365,8 @@ public struct ContentView: View {
 
         undoCoordinator.commitTypingIfNeeded(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
         undoCoordinator.takeSnapshot(entry: entry, actionName: "Paste", focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+
+        ensureImagesInCurrentArticle()
 
         // Determine where to paste
         if let focusedId = focusedTextItemId,
@@ -1250,15 +1394,22 @@ public struct ContentView: View {
 
     private func pasteIntoText(at index: Int, textItem: TextItem) {
         let attrContent = textItem.attributedContent
-        // Split exactly at cursor — no end-of-line advancement
         let splitPos = min(textItem.currentCursorPosition, attrContent.length)
+        let fullStr = attrContent.string as NSString
 
+        // "Before" portion: trim trailing newlines so no blank lines are left at the split boundary
+        var beforeLength = splitPos
+        while beforeLength > 0 {
+            let ch = fullStr.character(at: beforeLength - 1)
+            guard ch == 0x000A || ch == 0x000D else { break }
+            beforeLength -= 1
+        }
         let attrBefore = attrContent.attributedSubstring(
-            from: NSRange(location: 0, length: splitPos))
+            from: NSRange(location: 0, length: beforeLength))
+
+        // "After" portion: trim leading newlines/spaces
         let rawAfter = attrContent.attributedSubstring(
             from: NSRange(location: splitPos, length: attrContent.length - splitPos))
-
-        // Trim leading whitespace/newlines from the "after" portion
         let nsAfter = rawAfter.string as NSString
         var trimOffset = 0
         while trimOffset < nsAfter.length {
@@ -1271,8 +1422,10 @@ public struct ContentView: View {
                                                          length: rawAfter.length - trimOffset))
             : NSAttributedString()
 
-        // Preserve "before" portion with full formatting
+        // Update the text item and also push directly to the live NSTextView, which
+        // updateNSView normally skips while the view is first responder.
         textItem.attributedContent = attrBefore
+        focusedTextView?.textStorage?.setAttributedString(attrBefore)
 
         // Insert clipboard items after the current text item
         var insertIndex = index + 1
@@ -1281,12 +1434,18 @@ public struct ContentView: View {
             insertIndex += 1
         }
 
-        // Append the "after" portion, preserving its formatting
+        // Append the "after" portion
         if attrAfter.length > 0 {
             if insertIndex - 1 < entry.items.count,
                case .text(let pastedTextItem) = entry.items[insertIndex - 1] {
-                // Last pasted item is text — merge directly into it
+                // Last pasted item is text — trim its trailing newlines, then separate with
+                // exactly one blank line before appending the "after" content
                 let merged = NSMutableAttributedString(attributedString: pastedTextItem.attributedContent)
+                while merged.length > 0 {
+                    let last = (merged.string as NSString).character(at: merged.length - 1)
+                    guard last == 0x000A || last == 0x000D else { break }
+                    merged.deleteCharacters(in: NSRange(location: merged.length - 1, length: 1))
+                }
                 if merged.length > 0 {
                     merged.append(NSAttributedString(string: "\n\n",
                         attributes: [.font: bodyFont(), .foregroundColor: NSColor.textColor]))
@@ -1313,22 +1472,19 @@ public struct ContentView: View {
 
     private func handleImageTap(imageItem: ImageItem, index: Int, modifiers: NSEvent.ModifierFlags) {
         captionEditingId = nil
-        if modifiers.contains(.shift), let firstId = selectedItemId {
-            // Shift-click: select range
-            guard let firstIndex = entry.items.firstIndex(where: { $0.id == firstId }) else { return }
-
-            let rangeStart = min(firstIndex, index)
-            let rangeEnd = max(firstIndex, index)
-
+        if modifiers.contains(.shift), let anchorId = selectionAnchorId,
+           let anchorIndex = entry.items.firstIndex(where: { $0.id == anchorId }) {
+            // Shift-click: select range from anchor to here (works from text OR media anchor)
+            let lo = min(anchorIndex, index)
+            let hi = max(anchorIndex, index)
             selectedItemIds.removeAll()
-            for i in rangeStart...rangeEnd {
-                selectedItemIds.insert(entry.items[i].id)
-            }
-
+            for i in lo...hi { selectedItemIds.insert(entry.items[i].id) }
+            selectedItemId = nil
             focusedTextItemId = nil
         } else {
-            // Regular click: single select
+            // Plain click: single select, update anchor
             selectedItemId = imageItem.id
+            selectionAnchorId = imageItem.id
             selectedItemIds.removeAll()
             focusedTextItemId = nil
         }
@@ -1336,22 +1492,17 @@ public struct ContentView: View {
 
     private func handleVideoTap(videoItem: VideoItem, index: Int, modifiers: NSEvent.ModifierFlags) {
         captionEditingId = nil
-        if modifiers.contains(.shift), let firstId = selectedItemId {
-            // Shift-click: select range
-            guard let firstIndex = entry.items.firstIndex(where: { $0.id == firstId }) else { return }
-
-            let rangeStart = min(firstIndex, index)
-            let rangeEnd = max(firstIndex, index)
-
+        if modifiers.contains(.shift), let anchorId = selectionAnchorId,
+           let anchorIndex = entry.items.firstIndex(where: { $0.id == anchorId }) {
+            let lo = min(anchorIndex, index)
+            let hi = max(anchorIndex, index)
             selectedItemIds.removeAll()
-            for i in rangeStart...rangeEnd {
-                selectedItemIds.insert(entry.items[i].id)
-            }
-
+            for i in lo...hi { selectedItemIds.insert(entry.items[i].id) }
+            selectedItemId = nil
             focusedTextItemId = nil
         } else {
-            // Regular click: single select
             selectedItemId = videoItem.id
+            selectionAnchorId = videoItem.id
             selectedItemIds.removeAll()
             focusedTextItemId = nil
         }
@@ -1449,7 +1600,11 @@ public struct ContentView: View {
         guard let textView = focusedTextView,
               let textStorage = textView.textStorage else { return }
 
-        let selection = textView.selectedRange()
+        // Use the selection saved at Cmd-K time (before the menu system could clear it),
+        // falling back to the live value when triggered from the menu bar by mouse click.
+        let liveSelection = textView.selectedRange()
+        let selection = textView.hyperlinkTriggerSelection ?? liveSelection
+        textView.hyperlinkTriggerSelection = nil
         let length = textStorage.length
 
         if length == 0 {
@@ -2009,6 +2164,16 @@ public struct ContentView: View {
                 try await HTMLParser.load(from: loadURL, into: entry)
                 previousTitle = entry.title
                 SaveCoordinator.saveLastFilePath(entry.filePath ?? loadURL)
+                // If any image filename contains URL-special characters (e.g. '#'), the
+                // old HTML may have stored them un-encoded. Rewrite immediately so the
+                // on-disk HTML uses properly percent-encoded src/href attributes.
+                if entry.items.contains(where: { item in
+                    guard case .image(let img) = item else { return false }
+                    let base = (img.filename as NSString).deletingPathExtension
+                    return base.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) != base
+                }) {
+                    saveEntry(isManualSave: false)
+                }
                 await generateMissingWebImages(baseURL: loadURL.deletingLastPathComponent())
             } catch {
                 print("Failed to load article: \(error)")
@@ -2420,6 +2585,8 @@ class CustomNSTextView: NSTextView {
     var onSelectionChanged: (() -> Void)?
     var onEscapeKey: (() -> Void)?
     private var justBecameFirstResponder = false
+    /// Selection captured the moment Cmd-K fires, before the menu system can clear it.
+    var hyperlinkTriggerSelection: NSRange?
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         // Check if this is a file URL drag
@@ -2505,6 +2672,26 @@ class CustomNSTextView: NSTextView {
         return super.resignFirstResponder()
     }
 
+    // When AppKit assigns the real frame width (after SwiftUI lays out the container),
+    // recompute the text layout height and push it through the coordinator binding.
+    // This fixes the "images overlap text on load" bug: updateNSView runs before the
+    // view has a real frame, so the first height calculation is wrong (usedRect ≈ 20).
+    override func setFrameSize(_ newSize: NSSize) {
+        let previousWidth = frame.size.width
+        super.setFrameSize(newSize)
+        guard abs(newSize.width - previousWidth) > 1 else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  let lm = self.layoutManager,
+                  let tc = self.textContainer else { return }
+            lm.ensureLayout(for: tc)
+            let h = max(20, lm.usedRect(for: tc).height)
+            if abs((self.coordinator?.parent.height ?? h) - h) > 1 {
+                self.coordinator?.parent.height = h
+            }
+        }
+    }
+
     override func keyDown(with event: NSEvent) {
         // Prevent navigation immediately after becoming first responder
         // to avoid double-navigation when focusing empty text items
@@ -2580,6 +2767,13 @@ class CustomNSTextView: NSTextView {
             // Internal paste declined — fall through to paste(_:) which normalises
             // external content and has a guaranteed NSTextView fallback
             return super.performKeyEquivalent(with: event)
+        }
+
+        // Cmd-K (hyperlink): save the current selection NOW, before the menu system
+        // dispatches the action — AppKit can clear selectedRange() between here and there.
+        if isCmd && char == "k" {
+            let sel = selectedRange()
+            hyperlinkTriggerSelection = sel.length > 0 ? sel : nil
         }
 
         // B/I/U are handled exclusively by the Format menu (via applyFormattingAction).
@@ -3210,6 +3404,16 @@ class CustomNSTextView: NSTextView {
     override func paste(_ sender: Any?) {
         let pasteboard = NSPasteboard.general
 
+        // HTML (most common when copying from browsers/web apps) — parse then normalize
+        if let data = pasteboard.data(forType: NSPasteboard.PasteboardType("public.html")),
+           let parsed = try? NSAttributedString(
+               data: data,
+               options: [.documentType: NSAttributedString.DocumentType.html,
+                         .characterEncoding: String.Encoding.utf8.rawValue as NSNumber],
+               documentAttributes: nil) {
+            self.insertText(normalizeForPaste(parsed), replacementRange: self.selectedRange())
+            return
+        }
         if let data = pasteboard.data(forType: .rtf),
            let parsed = try? NSAttributedString(
                data: data,
@@ -3365,8 +3569,9 @@ struct EntryContentView: View {
     }
 
     private func handleTextItemImageDrop(urls: [URL], at index: Int, textItem: TextItem) {
-        let cursorPos = (focusedTextItemId == textItem.id) ? textItem.currentCursorPosition : nil
-        onImageURLsDrop(urls, index, cursorPos)
+        // currentCursorPosition is always set from the actual drop pixel location in
+        // performDragOperation, regardless of whether the text view has keyboard focus.
+        onImageURLsDrop(urls, index, textItem.currentCursorPosition)
     }
 
     private func handleDropAtEnd(providers: [NSItemProvider]) {
@@ -3385,8 +3590,9 @@ struct EntryContentView: View {
             await MainActor.run {
                 switch entry.items[index] {
                 case .text(let textItem):
-                    let cursorPos = (focusedTextItemId == textItem.id) ? textItem.currentCursorPosition : nil
-                    onImageURLsDrop(urls, index, cursorPos)
+                    // currentCursorPosition is set from the drop pixel location in
+                    // performDragOperation — use it regardless of keyboard focus state.
+                    onImageURLsDrop(urls, index, textItem.currentCursorPosition)
                 case .image, .video:
                     onImageURLsDrop(urls, index, nil)
                 }
@@ -3450,6 +3656,11 @@ struct EntryContentView: View {
                 onUndo: onUndo,
                 onRedo: onRedo,
                 onEscapeKey: onEscapeKey
+            )
+            .background(
+                selectedItemIds.contains(textItem.id)
+                    ? Color.accentColor.opacity(0.12)
+                    : Color.clear
             )
         case .image(let imageItem):
             ImageItemView(
@@ -3872,10 +4083,12 @@ class FormatNSButton: NSButton {
 // CutPasteHandler monitors keyboard events for cut/paste/undo/redo shortcuts
 struct CutPasteHandler: NSViewRepresentable {
     let canCut: Bool
+    let canCopy: Bool
     let canPaste: Bool
     let canUndo: Bool
     let canRedo: Bool
     let onCut: () -> Void
+    let onCopy: () -> Void
     let onPaste: () -> Void
     let onUndo: () -> Void
     let onRedo: () -> Void
@@ -3883,10 +4096,12 @@ struct CutPasteHandler: NSViewRepresentable {
     func makeNSView(context: Context) -> CutPasteHandlingView {
         let view = CutPasteHandlingView()
         view.canCut = canCut
+        view.canCopy = canCopy
         view.canPaste = canPaste
         view.canUndo = canUndo
         view.canRedo = canRedo
         view.onCut = onCut
+        view.onCopy = onCopy
         view.onPaste = onPaste
         view.onUndo = onUndo
         view.onRedo = onRedo
@@ -3895,10 +4110,12 @@ struct CutPasteHandler: NSViewRepresentable {
 
     func updateNSView(_ nsView: CutPasteHandlingView, context: Context) {
         nsView.canCut = canCut
+        nsView.canCopy = canCopy
         nsView.canPaste = canPaste
         nsView.canUndo = canUndo
         nsView.canRedo = canRedo
         nsView.onCut = onCut
+        nsView.onCopy = onCopy
         nsView.onPaste = onPaste
         nsView.onUndo = onUndo
         nsView.onRedo = onRedo
@@ -3907,10 +4124,12 @@ struct CutPasteHandler: NSViewRepresentable {
 
 class CutPasteHandlingView: NSView {
     var canCut: Bool = false
+    var canCopy: Bool = false
     var canPaste: Bool = false
     var canUndo: Bool = false
     var canRedo: Bool = false
     var onCut: (() -> Void)?
+    var onCopy: (() -> Void)?
     var onPaste: (() -> Void)?
     var onUndo: (() -> Void)?
     var onRedo: (() -> Void)?
@@ -3935,9 +4154,13 @@ class CutPasteHandlingView: NSView {
             return true
         }
 
-        // Only handle cut/paste, let other shortcuts pass through
+        // Only handle cut/copy/paste when a media range is selected (not text focus)
         if isCmd && char == "x" && canCut {
             onCut?()
+            return true
+        }
+        if isCmd && char == "c" && canCopy {
+            onCopy?()
             return true
         }
         if isCmd && char == "v" && canPaste {

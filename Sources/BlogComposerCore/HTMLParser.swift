@@ -550,8 +550,10 @@ class HTMLParser {
             return nil
         }
 
+        // XMLDocument percent-encodes spaces/special chars in src — decode before building a file URL
+        let decodedSrc = srcAttr.removingPercentEncoding ?? srcAttr
         // src attribute already points to small/filename.jpg
-        let smallURL = URL(fileURLWithPath: srcAttr, relativeTo: baseURL).standardizedFileURL
+        let smallURL = URL(fileURLWithPath: decodedSrc, relativeTo: baseURL).standardizedFileURL
         let baseFilename = (smallURL.lastPathComponent as NSString).deletingPathExtension
 
         // Look up the original filename (with its extension) from the pre-built full/ map
