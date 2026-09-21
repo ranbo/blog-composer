@@ -33,6 +33,14 @@ iframe.YOUTUBE-iframe-video {
     margin: 0 auto;
 }
 
+/* Caption under a video clip — matches the grey italic used for image captions. */
+.video-caption {
+    color: grey;
+    font-style: italic;
+    text-align: center;
+    margin-top: 4px;
+}
+
 .tr-caption-container {
     color: grey;
     font-style: italic;

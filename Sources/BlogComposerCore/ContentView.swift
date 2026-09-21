@@ -147,7 +147,22 @@ public struct ContentView: View {
     public init() {}
     @StateObject private var entry = BlogEntry()
     @StateObject private var undoCoordinator = UndoCoordinator()
-    @State private var showVideoDialog = false
+    /// What the video sheet is doing.  This is `.sheet(item:)` rather than
+    /// `.sheet(isPresented:)` on purpose: the dialog seeds its text fields with @State
+    /// initial values, which SwiftUI only applies when the view gets a fresh identity.
+    /// With a plain bool the second presentation reused the first one's empty state, so
+    /// editing an existing video showed blank fields.
+    enum VideoSheetTarget: Identifiable {
+        case add
+        case edit(VideoItem)
+        var id: String {
+            switch self {
+            case .add: return "add"
+            case .edit(let v): return v.id.uuidString
+            }
+        }
+    }
+    @State private var videoSheet: VideoSheetTarget? = nil
     @State private var pendingVideoDropIndex: Int = 0
     @State private var pendingVideoCursorPosition: Int? = nil
     @State private var showHyperlinkDialog = false
@@ -179,7 +194,12 @@ public struct ContentView: View {
     @State private var saveErrorMessage = ""
 
     // Publish state
-    enum PublishState { case idle, publishing, success(URL), failure(String) }
+    enum PublishState {
+        case idle, publishing, failure(String)
+        case success(URL)
+        /// Moved into TravelBlog/ but not uploaded, because no bucket is set.
+        case successLocalOnly(URL)
+    }
     @State private var publishState: PublishState = .idle
 
     // Email draft state
@@ -291,7 +311,7 @@ public struct ContentView: View {
                         // textItem.content the updateNSView guard (firstResponder != textView)
                         // allows the NSTextView to be updated from the model.
                         focusedTextView?.window?.makeFirstResponder(nil)
-                        showVideoDialog = true
+                        videoSheet = .add
                     }
 
                     Button("Preview") {
@@ -337,6 +357,13 @@ public struct ContentView: View {
                                 }
                             }
                             .foregroundColor(.green)
+                        } else if case .successLocalOnly(let url) = publishState {
+                            Button(isPublished ? "Updated locally" : "Published locally") {
+                                NSWorkspace.shared.open(url)
+                            }
+                            .foregroundColor(.orange)
+                            .help("Saved to TravelBlog but not uploaded: no GCS bucket is "
+                                  + "set. Enter a bucket name, then click Update.")
                         } else if isPublished {
                             Button("Update") {
                                 Task { await updateToGCS() }
@@ -429,13 +456,28 @@ public struct ContentView: View {
                 onUpdateCaption: updateImageCaption,
                 onImageTap: handleImageTap,
                 onVideoTap: handleVideoTap,
+                onVideoEdit: beginEditingVideo,
                 onPaste: handlePaste,
                 onTextViewFocusChanged: { textView in
+                    // Moving to another block ends the typing run, so undo can't reach back
+                    // into text that is no longer on screen.
+                    if textView !== focusedTextView {
+                        undoCoordinator.commitTypingIfNeeded(entry: entry,
+                                                             focusedTextItemId: focusedTextItemId,
+                                                             selectedItemId: selectedItemId)
+                    }
                     focusedTextView = textView
                     updateActiveFormats()
                 },
                 onSelectionChanged: {
                     updateActiveFormats()
+                },
+                onTextViewMouseDown: {
+                    // A click moves the caret, so anything typed next belongs to a new run.
+                    // Only clicks — selection changes fire on every keystroke too.
+                    undoCoordinator.commitTypingIfNeeded(entry: entry,
+                                                         focusedTextItemId: focusedTextItemId,
+                                                         selectedItemId: selectedItemId)
                 },
                 onImageURLsDrop: { urls, index, cursorPos in
                     importImages(urls: urls, at: index, cursorPosition: cursorPos)
@@ -451,6 +493,7 @@ public struct ContentView: View {
                 onUndo: performUndo,
                 onRedo: performRedo
             )
+
             .overlay {
                 if let progress = importProgress {
                     ImportProgressOverlay(current: progress.current, total: progress.total) {
@@ -514,11 +557,28 @@ public struct ContentView: View {
                 }
             )
         }
-        .sheet(isPresented: $showVideoDialog) {
-            VideoDialogView(onAdd: { url, title in
-                entry.insertVideo(url: url, title: title,
-                                  at: pendingVideoDropIndex,
-                                  cursorPosition: pendingVideoCursorPosition)
+        .sheet(item: $videoSheet) { target in
+            let existing: VideoItem? = { if case .edit(let v) = target { return v }; return nil }()
+            VideoDialogView(url: existing?.youtubeURL ?? "",
+                            title: existing?.title,
+                            isEditing: existing != nil,
+                            onAdd: { url, title in
+                if let existing {
+                    commitVideoEdit(existing, url: url, title: title)
+                    return
+                }
+                // Close the open typing run and record a "before" first.  Without this pair
+                // the commit below pushed whatever snapshot happened to be pending — the
+                // start of the typing run — so one undo swallowed the video AND the text.
+                undoCoordinator.commitTypingIfNeeded(entry: entry,
+                                                     focusedTextItemId: focusedTextItemId,
+                                                     selectedItemId: selectedItemId)
+                undoCoordinator.takeSnapshot(entry: entry, actionName: "Add Video",
+                                             focusedTextItemId: focusedTextItemId,
+                                             selectedItemId: selectedItemId)
+                let newVideoId = entry.insertVideo(url: url, title: title,
+                                                   at: pendingVideoDropIndex,
+                                                   cursorPosition: pendingVideoCursorPosition)
                 // Move focus to the text item that follows the new video
                 let newFocusIndex = pendingVideoDropIndex + 2
                 if newFocusIndex < entry.items.count,
@@ -528,6 +588,11 @@ public struct ContentView: View {
                 undoCoordinator.commitAction(entry: entry,
                                              focusedTextItemId: focusedTextItemId,
                                              selectedItemId: selectedItemId)
+                // The video goes in as 16:9 straight away; correct it in the background if
+                // YouTube says otherwise (portrait clips and Shorts are 9:16).  Staying 16:9
+                // when offline is the right fallback — it covers the large majority of
+                // uploads, and the shape can be set by hand from the context menu.
+                lookUpVideoAspect(id: newVideoId, url: url)
             })
         }
         .alert("Sync Failed", isPresented: $showSyncError) {
@@ -661,8 +726,10 @@ public struct ContentView: View {
             Text(regenerateIndexErrorMessage)
         }
         .onChange(of: entry.isDirty) { _, isDirty in
-            if isDirty, case .success = publishState {
-                publishState = .idle
+            guard isDirty else { return }
+            switch publishState {
+            case .success, .successLocalOnly: publishState = .idle
+            default: break
             }
         }
         .onChange(of: focusedTextItemId) { _, newId in
@@ -813,12 +880,15 @@ public struct ContentView: View {
                 SaveCoordinator.saveLastFilePath(publishedURL)
             }
             articleManager.refresh()
-            // Sync to GCS if a bucket is configured
+            // Sync to GCS if a bucket is configured. Without one the article is only
+            // promoted locally, which must not be reported as a completed publish.
             if !gcsBucket.isEmpty {
                 let articleDir = publishedURL.deletingLastPathComponent()
                 try await TravelBlogPublisher.syncArticle(folderURL: articleDir, bucketName: gcsBucket)
+                publishState = .success(publishedURL)
+            } else {
+                publishState = .successLocalOnly(publishedURL)
             }
-            publishState = .success(publishedURL)
         } catch {
             publishState = .failure(error.localizedDescription)
         }
@@ -1487,6 +1557,38 @@ public struct ContentView: View {
             selectionAnchorId = imageItem.id
             selectedItemIds.removeAll()
             focusedTextItemId = nil
+        }
+    }
+
+    /// Looks up the real frame shape and applies it, refreshing the action's redo state so
+    /// redo reproduces the corrected aspect rather than the 16:9 placeholder.
+    private func lookUpVideoAspect(id: UUID, url: String) {
+        guard let videoId = HTMLConverter.youTubeVideoId(url) else { return }
+        let depth = undoCoordinator.actionCount
+        Task { @MainActor in
+            guard let a = await VideoAspect.fetch(videoId: videoId) else { return }
+            guard entry.setVideoAspect(id: id, width: a.w, height: a.h) else { return }
+            undoCoordinator.refreshLatestAfter(entry: entry, ifDepthIs: depth,
+                                               focusedTextItemId: focusedTextItemId,
+                                               selectedItemId: selectedItemId)
+        }
+    }
+
+    /// Double-clicking a video opens the same sheet used to add one, pre-filled.
+    private func beginEditingVideo(_ videoItem: VideoItem) {
+        videoSheet = .edit(videoItem)
+    }
+
+    private func commitVideoEdit(_ videoItem: VideoItem, url: String, title: String?) {
+        undoCoordinator.commitTypingIfNeeded(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+        undoCoordinator.takeSnapshot(entry: entry, actionName: "Edit Video",
+                                     focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+        let result = entry.updateVideo(id: videoItem.id, url: url, title: title)
+        guard result.changed else { return }
+        undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+        // A different video is a different shape, so measure it again.
+        if result.urlChanged {
+            lookUpVideoAspect(id: videoItem.id, url: url)
         }
     }
 
@@ -2253,6 +2355,7 @@ struct TextItemView: View {
     let onPaste: () -> Bool
     let onTextViewFocusChanged: (CustomNSTextView?) -> Void
     let onSelectionChanged: () -> Void
+    let onTextViewMouseDown: () -> Void
     let onTextDidChange: (Character?) -> Void
     var onUndo: (() -> Void)?
     var onRedo: (() -> Void)?
@@ -2277,6 +2380,7 @@ struct TextItemView: View {
                 onPaste: onPaste,
                 onTextViewFocusChanged: onTextViewFocusChanged,
                 onSelectionChanged: onSelectionChanged,
+                onTextViewMouseDown: onTextViewMouseDown,
                 onTextDidChange: onTextDidChange,
                 onUndo: onUndo,
                 onRedo: onRedo,
@@ -2307,6 +2411,7 @@ struct MacTextEditor: NSViewRepresentable {
     let onPaste: () -> Bool
     let onTextViewFocusChanged: (CustomNSTextView?) -> Void
     let onSelectionChanged: () -> Void
+    let onTextViewMouseDown: () -> Void
     let onTextDidChange: (Character?) -> Void
     var onUndo: (() -> Void)?
     var onRedo: (() -> Void)?
@@ -2319,6 +2424,7 @@ struct MacTextEditor: NSViewRepresentable {
         textView.onPaste = onPaste
         textView.onFocusChanged = onTextViewFocusChanged
         textView.onSelectionChanged = onSelectionChanged
+        textView.onMouseDown = onTextViewMouseDown
         textView.onUndo = onUndo
         textView.onRedo = onRedo
         textView.onEscapeKey = onEscapeKey
@@ -2368,6 +2474,7 @@ struct MacTextEditor: NSViewRepresentable {
         textView.onRedo = onRedo
         textView.onFocusChanged = onTextViewFocusChanged
         textView.onSelectionChanged = onSelectionChanged
+        textView.onMouseDown = onTextViewMouseDown
         textView.onEscapeKey = onEscapeKey
         context.coordinator.parent = self
         context.coordinator.findRegistry = findRegistry
@@ -2583,6 +2690,9 @@ class CustomNSTextView: NSTextView {
     var onRedo: (() -> Void)?
     var onFocusChanged: ((CustomNSTextView?) -> Void)?
     var onSelectionChanged: (() -> Void)?
+    /// Fires on a click in the text, before the caret moves.  Used to end the current
+    /// typing run: a selection change alone is no good, because typing fires that too.
+    var onMouseDown: (() -> Void)?
     var onEscapeKey: (() -> Void)?
     private var justBecameFirstResponder = false
     /// Selection captured the moment Cmd-K fires, before the menu system can clear it.
@@ -2650,6 +2760,11 @@ class CustomNSTextView: NSTextView {
         let charIndex = layoutManager.characterIndex(for: containerPoint, in: textContainer, fractionOfDistanceBetweenInsertionPoints: &fraction)
 
         return min(charIndex, string.count)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onMouseDown?()
+        super.mouseDown(with: event)
     }
 
     override func becomeFirstResponder() -> Bool {
@@ -3491,9 +3606,11 @@ struct EntryContentView: View {
     let onUpdateCaption: (UUID, String?) -> Void
     let onImageTap: (ImageItem, Int, NSEvent.ModifierFlags) -> Void
     let onVideoTap: (VideoItem, Int, NSEvent.ModifierFlags) -> Void
+    let onVideoEdit: (VideoItem) -> Void
     let onPaste: () -> Bool
     let onTextViewFocusChanged: (CustomNSTextView?) -> Void
     let onSelectionChanged: () -> Void
+    let onTextViewMouseDown: () -> Void
     let onImageURLsDrop: ([URL], Int, Int?) -> Void
     let onTextDidChange: (Character?) -> Void
     var onUndo: (() -> Void)?
@@ -3652,6 +3769,7 @@ struct EntryContentView: View {
                 onPaste: onPaste,
                 onTextViewFocusChanged: onTextViewFocusChanged,
                 onSelectionChanged: onSelectionChanged,
+                onTextViewMouseDown: onTextViewMouseDown,
                 onTextDidChange: onTextDidChange,
                 onUndo: onUndo,
                 onRedo: onRedo,
@@ -3684,7 +3802,11 @@ struct EntryContentView: View {
                 isSelected: selectedItemId == videoItem.id || selectedItemIds.contains(videoItem.id),
                 onTap: { modifiers in
                     onVideoTap(videoItem, index, modifiers)
-                }
+                },
+                onSetAspect: { w, h in
+                    entry.setVideoAspect(id: videoItem.id, width: w, height: h)
+                },
+                onEdit: { onVideoEdit(videoItem) }
             )
         }
     }
@@ -3902,6 +4024,10 @@ struct VideoItemView: View {
     let videoItem: VideoItem
     let isSelected: Bool
     let onTap: (NSEvent.ModifierFlags) -> Void
+    /// Manual shape override, for when the automatic lookup was unavailable or wrong.
+    let onSetAspect: (Int, Int) -> Void
+    /// Double-click opens the video for editing.
+    let onEdit: () -> Void
 
     var body: some View {
         VStack {
@@ -3909,7 +4035,10 @@ struct VideoItemView: View {
                 .font(.system(size: 60))
                 .foregroundColor(.blue)
 
-            if let title = videoItem.title {
+            // Title above the URL.  Optional — most videos are introduced by the
+            // sentence above them instead, so an untitled one shows nothing here.
+            if let title = videoItem.title?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !title.isEmpty {
                 Text(title)
                     .font(.headline)
             }
@@ -3927,12 +4056,22 @@ struct VideoItemView: View {
                 .stroke(isSelected ? Color.blue : Color.clear, lineWidth: 3)
         )
         .contentShape(Rectangle())
+        .onTapGesture(count: 2) {
+            onEdit()
+        }
         .onTapGesture {
             if let event = NSApp.currentEvent {
                 onTap(event.modifierFlags)
             } else {
                 onTap([])
             }
+        }
+        .contextMenu {
+            Button("Edit Video…") { onEdit() }
+            Divider()
+            Button("Landscape (16:9)") { onSetAspect(16, 9) }
+            Button("Portrait (9:16)")  { onSetAspect(9, 16) }
+            Button("Classic (4:3)")    { onSetAspect(4, 3) }
         }
     }
 }
@@ -4230,13 +4369,23 @@ struct HyperlinkDialogView: View {
 
 struct VideoDialogView: View {
     @Environment(\.dismiss) var dismiss
-    @State private var youtubeURL = ""
-    @State private var videoTitle = ""
+    @State private var youtubeURL: String
+    @State private var videoTitle: String
+    /// Editing an existing video rather than adding one — changes the wording only.
+    let isEditing: Bool
     let onAdd: (String, String?) -> Void
+
+    init(url: String = "", title: String? = nil, isEditing: Bool = false,
+         onAdd: @escaping (String, String?) -> Void) {
+        _youtubeURL = State(initialValue: url)
+        _videoTitle = State(initialValue: title ?? "")
+        self.isEditing = isEditing
+        self.onAdd = onAdd
+    }
 
     var body: some View {
         VStack(spacing: 16) {
-            Text("Add YouTube Video")
+            Text(isEditing ? "Edit YouTube Video" : "Add YouTube Video")
                 .font(.headline)
 
             TextField("YouTube URL", text: $youtubeURL)
@@ -4252,7 +4401,7 @@ struct VideoDialogView: View {
 
                 Spacer()
 
-                Button("Add") {
+                Button(isEditing ? "Save" : "Add") {
                     onAdd(youtubeURL, videoTitle.isEmpty ? nil : videoTitle)
                     dismiss()
                 }

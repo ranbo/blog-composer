@@ -108,6 +108,22 @@ struct VideoItem: Identifiable {
     let id = UUID()
     var youtubeURL: String
     var title: String?
+
+    /// The video's true frame shape, used to size the embed so the player never
+    /// letterboxes.  Defaults to 16:9, which covers the large majority of uploads;
+    /// portrait phone clips and Shorts are 9:16.
+    var aspectWidth: Int = 16
+    var aspectHeight: Int = 9
+
+    /// Embed box for the current aspect, with the long edge capped at 640px so a
+    /// portrait clip stands as tall as a landscape one is wide.
+    /// 16:9 -> 640x360,  9:16 -> 360x640,  4:3 -> 640x480.
+    var boxSize: (width: Int, height: Int) {
+        let w = Double(aspectWidth), h = Double(aspectHeight)
+        guard w > 0, h > 0 else { return (640, 360) }
+        if w >= h { return (640, Int((640.0 * h / w).rounded())) }
+        return (Int((640.0 * w / h).rounded()), 640)
+    }
 }
 
 // The main entry/post
@@ -315,7 +331,10 @@ class BlogEntry: ObservableObject {
     }
 
     // Insert a video with the same cursor-aware text-splitting logic as insertImages.
-    func insertVideo(url: String, title: String?, at dropIndex: Int, cursorPosition: Int?) {
+    /// Inserts a video and returns its id, so callers can fill in the real aspect
+    /// once the asynchronous lookup comes back.
+    @discardableResult
+    func insertVideo(url: String, title: String?, at dropIndex: Int, cursorPosition: Int?) -> UUID {
         var insertIndex = dropIndex
         var attrAfter = NSAttributedString()
 
@@ -353,6 +372,45 @@ class BlogEntry: ObservableObject {
         }
 
         ensureTextItemsExist()
+        return videoItem.id
+    }
+
+    /// Replaces a video's URL and title.  Returns true if anything changed, and whether
+    /// the URL is now different — the caller re-runs the aspect lookup in that case, since
+    /// the old shape describes a different video.
+    @discardableResult
+    func updateVideo(id: UUID, url: String, title: String?) -> (changed: Bool, urlChanged: Bool) {
+        for (i, item) in items.enumerated() {
+            guard case .video(var v) = item, v.id == id else { continue }
+            let urlChanged = v.youtubeURL != url
+            guard urlChanged || v.title != title else { return (false, false) }
+            v.youtubeURL = url
+            v.title = title
+            if urlChanged {
+                // Don't carry the previous video's shape over; 16:9 until the lookup lands.
+                v.aspectWidth = 16
+                v.aspectHeight = 9
+            }
+            items[i] = .video(v)
+            return (true, urlChanged)
+        }
+        return (false, false)
+    }
+
+    /// Updates a video's frame shape in place.  Used by the asynchronous aspect lookup
+    /// and by the manual override; a no-op if the item is gone or already that shape.
+    @discardableResult
+    func setVideoAspect(id: UUID, width: Int, height: Int) -> Bool {
+        guard width > 0, height > 0 else { return false }
+        for (i, item) in items.enumerated() {
+            guard case .video(var v) = item, v.id == id else { continue }
+            guard v.aspectWidth != width || v.aspectHeight != height else { return false }
+            v.aspectWidth = width
+            v.aspectHeight = height
+            items[i] = .video(v)
+            return true
+        }
+        return false
     }
 
     func addText(_ text: String = "", at index: Int? = nil) {

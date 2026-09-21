@@ -121,9 +121,28 @@ class HTMLConverter {
                 }
             case .video(let videoItem):
                 if let videoId = youTubeVideoId(videoItem.youtubeURL) {
-                    html += "  <div style=\"max-width: 640px;\"><iframe allowfullscreen=\"\" class=\"BLOG_video_class\" height=\"480\" src=\"https://www.youtube.com/embed/\(videoId)\" width=\"640\" style=\"display: block; max-width: 100%;\" youtube-src-id=\"\(videoId)\"></iframe></div>\n\n"
+                    // Size the box to the video's real shape and let `aspect-ratio` hold it at
+                    // every window width, so the player never letterboxes.  The width/height
+                    // attributes carry the aspect back in on reload.
+                    let box = videoItem.boxSize
+                    // `title` is the standard iframe attribute for an accessible name, so the
+                    // caption the author typed both survives a reload and is announced by
+                    // screen readers.  Omitted entirely when there is no title.
+                    let title = videoItem.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let hasTitle = !(title ?? "").isEmpty
+                    // `title` on the iframe is the accessible name and what the parser reads
+                    // back; the caption below the clip is what a reader sees.
+                    let titleAttr = hasTitle ? " title=\"\(escapeHTML(title!))\"" : ""
+                    let caption = hasTitle
+                        ? "<div class=\"video-caption\">\(escapeHTML(title!))</div>" : ""
+                    // Centre the box inline rather than leaning on a `div:has(...)` rule, so
+                    // videos sit centred like images do even where :has() isn't supported.
+                    html += "  <div style=\"max-width: \(box.width)px; margin-left: auto; margin-right: auto;\"><iframe allowfullscreen=\"\" class=\"BLOG_video_class\"\(titleAttr) height=\"\(box.height)\" src=\"https://www.youtube.com/embed/\(videoId)\" width=\"\(box.width)\" style=\"display: block; width: 100%; aspect-ratio: \(box.width) / \(box.height);\" youtube-src-id=\"\(videoId)\"></iframe>\(caption)</div>\n\n"
                 } else {
-                    html += "  <p><a href=\"\(escapeHTML(videoItem.youtubeURL))\">\(escapeHTML(videoItem.title ?? videoItem.youtubeURL))</a></p>\n\n"
+                    // Fallback for a video whose URL yields no embeddable id.  The marker class
+                    // is what distinguishes it from an ordinary YouTube hyperlink in prose, which
+                    // is a reference to someone else's video and must stay a link on reload.
+                    html += "  <p><a href=\"\(escapeHTML(videoItem.youtubeURL))\" class=\"blog-video-link\">\(escapeHTML(videoItem.title ?? videoItem.youtubeURL))</a></p>\n\n"
                 }
             }
         }
@@ -141,7 +160,7 @@ class HTMLConverter {
             a.style.display = 'inline-block';
             var img = document.createElement('img');
             img.src = 'https://img.youtube.com/vi/' + id + '/sddefault.jpg';
-            img.style.width = '640px';
+            img.style.width = (fr.getAttribute('width') || 640) + 'px';
             img.style.height = 'auto';
             img.style.cursor = 'pointer';
             img.style.display = 'block';
@@ -417,7 +436,11 @@ class HTMLConverter {
             return ""
         }
 
-        var html = ""
+        // Collect the attribute runs first.  A single hyperlink can span several runs when
+        // its text contains inline formatting (e.g. "did the <i>haka</i> before each match"),
+        // so the <a> wrapper is applied afterwards, once per span of equally-linked runs,
+        // rather than once per run.
+        var runs: [(link: String?, inner: String)] = []
 
         // Enumerate through attribute runs
         attributedText.enumerateAttributes(in: range, options: []) { attrs, subRange, _ in
@@ -452,14 +475,34 @@ class HTMLConverter {
                 }
             }
 
-            // Check for link (outermost)
+            // Record the link target (applied below, after adjacent runs are merged)
+            var link: String? = nil
             if let linkURL = attrs[.link] as? URL {
-                formatted = "<a href=\"\(escapeHTML(linkURL.absoluteString))\">\(formatted)</a>"
+                link = linkURL.absoluteString
             } else if let linkString = attrs[.link] as? String, !linkString.isEmpty {
-                formatted = "<a href=\"\(escapeHTML(linkString))\">\(formatted)</a>"
+                link = linkString
             }
 
-            html += formatted
+            runs.append((link, formatted))
+        }
+
+        // Emit, wrapping each maximal span of runs sharing one link target in a single <a>.
+        var html = ""
+        var i = 0
+        while i < runs.count {
+            let link = runs[i].link
+            var inner = runs[i].inner
+            var j = i + 1
+            if let link {
+                while j < runs.count, runs[j].link == link {
+                    inner += runs[j].inner
+                    j += 1
+                }
+                html += "<a href=\"\(escapeHTML(link))\">\(inner)</a>"
+            } else {
+                html += inner
+            }
+            i = j
         }
 
         return html

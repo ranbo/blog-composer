@@ -4,6 +4,22 @@ import Foundation
 import AppKit
 
 class HTMLParser {
+
+    /// Reads a video's frame shape off an <iframe>'s width/height attributes.
+    /// Falls back to 16:9 when they are missing or nonsensical.
+    /// The author's caption, stored as the iframe's `title` attribute.
+    private static func videoTitle(of iframe: XMLElement) -> String? {
+        guard let t = iframe.attribute(forName: "title")?.stringValue else { return nil }
+        let trimmed = t.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func aspect(of iframe: XMLElement) -> (w: Int, h: Int) {
+        guard let ws = iframe.attribute(forName: "width")?.stringValue, let w = Int(ws), w > 0,
+              let hs = iframe.attribute(forName: "height")?.stringValue, let h = Int(hs), h > 0
+        else { return (16, 9) }
+        return (w, h)
+    }
     enum ParseError: Error, LocalizedError {
         case fileNotFound
         case invalidHTML
@@ -135,18 +151,42 @@ class HTMLParser {
                             if let imageItem = loadImage(from: imgEl, baseURL: baseURL, fullFilenameMap: fullFilenameMap) {
                                 entry.items.append(.image(imageItem))
                             }
-                        } else if let href = childEl.attribute(forName: "href")?.stringValue,
-                                  href.contains("youtube.com") || href.contains("youtu.be") {
-                            // YouTube link without image thumbnail — treat as video
+                        } else if (childEl.attribute(forName: "class")?.stringValue ?? "")
+                                    .contains("blog-video-link"),
+                                  let href = childEl.attribute(forName: "href")?.stringValue {
+                            // Our own fallback markup for a video with no embeddable id.
                             if !foundMedia {
                                 appendTextItem(from: currentTextContent, into: entry)
                                 currentTextContent = NSMutableAttributedString()
                                 foundMedia = true
                             }
                             let title = childEl.stringValue
-                            let videoItem = VideoItem(youtubeURL: href, title: title?.isEmpty == true ? nil : title)
-                            entry.items.append(.video(videoItem))
+                            entry.items.append(.video(VideoItem(youtubeURL: href,
+                                                                title: title?.isEmpty == true ? nil : title)))
                         }
+                        // Any other non-image <a> is an ordinary hyperlink — including one pointing at
+                        // YouTube, which is a reference to someone else's video, not an inclusion
+                        // of one of ours.  Leave it to the text path below, which preserves it as
+                        // an inline link; promoting it to a VideoItem would embed a player and
+                        // discard the sentence it sits in.
+
+                    case "iframe":
+                        // Video iframe inside <p>.  Posts downloaded from Blogger arrive as
+                        // <p><iframe src="https://www.youtube.com/embed/ID"></iframe></p>, so
+                        // without this case the iframe contributes no text and the video is
+                        // silently dropped, leaving only an empty <p></p> on the next save.
+                        guard let iframeSrc = childEl.attribute(forName: "src")?.stringValue,
+                              iframeSrc.contains("youtube.com") || iframeSrc.contains("youtu.be")
+                        else { continue }
+                        if !foundMedia {
+                            appendTextItem(from: currentTextContent, into: entry)
+                            currentTextContent = NSMutableAttributedString()
+                            foundMedia = true
+                        }
+                        let a = aspect(of: childEl)
+                        entry.items.append(.video(VideoItem(youtubeURL: iframeSrc,
+                                                            title: videoTitle(of: childEl),
+                                                            aspectWidth: a.w, aspectHeight: a.h)))
 
                     case "img":
                         // Bare image inside <p> (no anchor wrapper)
@@ -223,16 +263,22 @@ class HTMLParser {
                     if let imageItem = loadImage(from: imgElement, baseURL: baseURL, fullFilenameMap: fullFilenameMap) {
                         entry.items.append(.image(imageItem))
                     }
-                } else if let href = element.attribute(forName: "href")?.stringValue,
-                          href.contains("youtube.com") || href.contains("youtu.be") {
-                    // Flush accumulated text
+                } else if (element.attribute(forName: "class")?.stringValue ?? "")
+                            .contains("blog-video-link"),
+                          let href = element.attribute(forName: "href")?.stringValue {
                     appendTextItem(from: currentTextContent, into: entry)
                     currentTextContent = NSMutableAttributedString()
-
-                    // Add video
-                    let title = element.stringValue
-                    let videoItem = VideoItem(youtubeURL: href, title: title)
-                    entry.items.append(.video(videoItem))
+                    entry.items.append(.video(VideoItem(youtubeURL: href, title: element.stringValue)))
+                } else {
+                    // Plain hyperlink (YouTube or otherwise) — keep it as inline text.
+                    let attributed = try parseElement(element, baseURL: baseURL)
+                    if !attributed.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        if currentTextContent.length > 0 {
+                            currentTextContent.append(NSAttributedString(string: "\n"))
+                        }
+                        currentTextContent.append(attributed)
+                        lastNonEmptyWasHeading = false
+                    }
                 }
 
             case "div":
@@ -242,8 +288,10 @@ class HTMLParser {
                    src.contains("youtube.com") || src.contains("youtu.be") {
                     appendTextItem(from: currentTextContent, into: entry)
                     currentTextContent = NSMutableAttributedString()
-                    let videoItem = VideoItem(youtubeURL: src, title: nil)
-                    entry.items.append(.video(videoItem))
+                    let a = aspect(of: iframeElement)
+                    entry.items.append(.video(VideoItem(youtubeURL: src,
+                                                        title: videoTitle(of: iframeElement),
+                                                        aspectWidth: a.w, aspectHeight: a.h)))
                 }
 
             case "iframe":
@@ -252,8 +300,10 @@ class HTMLParser {
                    src.contains("youtube.com") || src.contains("youtu.be") {
                     appendTextItem(from: currentTextContent, into: entry)
                     currentTextContent = NSMutableAttributedString()
-                    let videoItem = VideoItem(youtubeURL: src, title: nil)
-                    entry.items.append(.video(videoItem))
+                    let a = aspect(of: element)
+                    entry.items.append(.video(VideoItem(youtubeURL: src,
+                                                        title: videoTitle(of: element),
+                                                        aspectWidth: a.w, aspectHeight: a.h)))
                 }
 
             case "table":

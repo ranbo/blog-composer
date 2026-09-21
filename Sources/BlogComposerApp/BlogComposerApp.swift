@@ -29,6 +29,20 @@ struct BlogComposerApp: App {
                 }
         }
         .commands {
+            CommandGroup(replacing: .appInfo) {
+                Button("About BlogComposer") {
+                    NSApplication.shared.orderFrontStandardAboutPanel(options: [
+                        .applicationVersion: BuildInfo.version,
+                        .credits: NSAttributedString(
+                            string: "Built \(BuildInfo.buildDate)",
+                            attributes: [
+                                .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+                                .foregroundColor: NSColor.secondaryLabelColor,
+                            ]
+                        ),
+                    ])
+                }
+            }
             CommandGroup(replacing: .undoRedo) {
                 Button("Undo \(undoCoordinator?.undoActionName ?? "")") {
                     undoAction?()
@@ -153,9 +167,16 @@ struct BlogComposerApp: App {
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Carry settings over from the pre-app-bundle preference domain. Must run
+        // before anything reads UserDefaults.
+        Preferences.migrateLegacyDomainIfNeeded()
+
         // Make sure the app can receive focus
         NSApplication.shared.setActivationPolicy(.regular)
         NSApplication.shared.activate(ignoringOtherApps: true)
+
+        // A SwiftPM executable has no bundle icon, so set it here.
+        AppIcon.applyToDock()
 
         // Initialize default directory structure
         let defaultPath = FileManager.default.homeDirectoryForCurrentUser

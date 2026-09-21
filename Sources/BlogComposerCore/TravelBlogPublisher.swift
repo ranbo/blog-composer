@@ -201,6 +201,27 @@ public class TravelBlogPublisher {
     }
 
     /// Syncs the entire TravelBlog folder to a GCS bucket, streaming progress.
+
+    /// Paths rsync must never upload, as one comma-separated value.
+    ///
+    /// Two things make this fiddly, and both have bitten us:
+    ///   * `--exclude` takes a *list*; passing the flag twice keeps only the last one, so
+    ///     the earlier pattern is silently dropped.  That put 12,000+ full-resolution
+    ///     originals in the bucket while the code looked correct.
+    ///   * The pattern is full-matched against the path *relative to the source*.  With the
+    ///     TravelBlog root as source that is `entry/full/x.jpg`, but syncing a single
+    ///     article it is just `full/x.jpg` — so `.*/full/` misses the second case, and a
+    ///     trailing `.*` is needed because the match is not a prefix search.
+    private static let rsyncExcludes = [
+        "(.*/)?full/.*",        // full-resolution originals stay local
+        "(.*/)?snapshot\\.html", // the editor's manual-save backups
+        "(.*/)?\\.DS_Store",     // Finder droppings
+        // Published to the same bucket but maintained outside TravelBlog.  Without this
+        // the root sync's --delete-unmatched-destination-objects treats the whole section
+        // as orphaned and deletes it, because nothing under TravelBlog corresponds to it.
+        "bob/.*"
+    ].joined(separator: ",")
+
     static func sync(bucketName: String,
                      onProgress: @escaping (SyncProgressUpdate) -> Void) async throws {
         try await runGcloudWithProgress([
@@ -209,8 +230,7 @@ public class TravelBlogPublisher {
             "gs://\(bucketName)",
             "--recursive",
             "--delete-unmatched-destination-objects",
-            "--exclude=.*/full/",
-            "--exclude=snapshot\\.html$",
+            "--exclude=\(rsyncExcludes)",
             "--cache-control=no-cache"
         ], bucketName: bucketName, onProgress: onProgress)
     }
@@ -274,7 +294,7 @@ public class TravelBlogPublisher {
             folderURL.path,
             "gs://\(bucketName)/\(folderName)",
             "--recursive",
-            "--exclude=.*/full/",
+            "--exclude=\(rsyncExcludes)",
             "--cache-control=no-cache"
         ])
 
@@ -297,16 +317,94 @@ public class TravelBlogPublisher {
                 utilDir.path,
                 "gs://\(bucketName)/util",
                 "--recursive",
+                "--exclude=\(rsyncExcludes)",
                 "--cache-control=no-cache"
             ])
         }
     }
 
+    // MARK: - Locating gcloud
+
+    /// Absolute path to the `gcloud` executable, or `nil` if it can't be found.
+    ///
+    /// An app bundle launched from Finder inherits launchd's PATH
+    /// (`/usr/bin:/bin:/usr/sbin:/sbin`), not the one from your shell profile.
+    /// That excludes every directory the Google Cloud SDK installs into, so
+    /// `/usr/bin/env gcloud` fails with "No such file or directory" even though
+    /// gcloud works fine in Terminal.
+    private static let gcloudURL: URL? = {
+        let fm = FileManager.default
+
+        // An explicit override wins, for installs in unusual places:
+        //   defaults write com.randywilson.blogcomposer GCloudPath /path/to/gcloud
+        if let custom = UserDefaults.standard.string(forKey: "GCloudPath"),
+           !custom.isEmpty, fm.isExecutableFile(atPath: custom) {
+            return URL(fileURLWithPath: custom)
+        }
+
+        let home = fm.homeDirectoryForCurrentUser.path
+        let candidates = [
+            "/opt/homebrew/bin/gcloud",
+            "/opt/homebrew/share/google-cloud-sdk/bin/gcloud",
+            "/usr/local/bin/gcloud",
+            "/usr/local/share/google-cloud-sdk/bin/gcloud",
+            "\(home)/google-cloud-sdk/bin/gcloud"
+        ]
+        for path in candidates where fm.isExecutableFile(atPath: path) {
+            return URL(fileURLWithPath: path)
+        }
+
+        // Last resort: a login shell knows whatever PATH the user's profile sets.
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        let probe = Process()
+        probe.executableURL = URL(fileURLWithPath: shell)
+        probe.arguments = ["-lc", "command -v gcloud"]
+        let pipe = Pipe()
+        probe.standardOutput = pipe
+        probe.standardError = FileHandle.nullDevice
+        guard (try? probe.run()) != nil else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        probe.waitUntilExit()
+        let found = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return fm.isExecutableFile(atPath: found) ? URL(fileURLWithPath: found) : nil
+    }()
+
+    private static func resolvedGcloud() throws -> URL {
+        guard let url = gcloudURL else {
+            throw PublishError.syncFailed(
+                "Could not find the gcloud command. Install the Google Cloud SDK, or point "
+                + "the app at it with:\n\n    defaults write "
+                + "com.randywilson.blogcomposer GCloudPath /path/to/gcloud")
+        }
+        return url
+    }
+
+    /// Environment for a gcloud subprocess.
+    ///
+    /// gcloud is a launcher script that has to find a Python interpreter. Under
+    /// launchd's PATH it finds only macOS's Python 3.9 and refuses to run, so
+    /// put its own directory and the usual package prefixes back on PATH.
+    private static func gcloudEnvironment(for tool: URL) -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        let preferred = [tool.deletingLastPathComponent().path,
+                         "/opt/homebrew/bin", "/usr/local/bin"]
+        let existing = (env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
+            .split(separator: ":").map(String.init)
+        var seen = Set<String>()
+        env["PATH"] = (preferred + existing)
+            .filter { seen.insert($0).inserted }
+            .joined(separator: ":")
+        return env
+    }
+
     /// Runs a gcloud subcommand, throwing PublishError.syncFailed on non-zero exit.
     private static func runGcloud(_ args: [String]) async throws {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["gcloud"] + args
+        let tool = try resolvedGcloud()
+        process.executableURL = tool
+        process.arguments = args
+        process.environment = gcloudEnvironment(for: tool)
         let outPipe = Pipe()
         let errPipe = Pipe()
         process.standardOutput = outPipe
@@ -341,8 +439,10 @@ public class TravelBlogPublisher {
         onProgress: @escaping (SyncProgressUpdate) -> Void
     ) async throws {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["gcloud"] + args
+        let tool = try resolvedGcloud()
+        process.executableURL = tool
+        process.arguments = args
+        process.environment = gcloudEnvironment(for: tool)
 
         let outPipe = Pipe()
         let errPipe = Pipe()

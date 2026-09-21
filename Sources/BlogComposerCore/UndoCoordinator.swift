@@ -7,7 +7,7 @@ import AppKit
 enum ItemSnapshot {
     case text(NSAttributedString)
     case image(NSImage?, String, URL?)  // resizedImage (may be nil if lazy), filename, smallURL
-    case video(String, String?)         // youtubeURL, title
+    case video(String, String?, Int, Int)  // youtubeURL, title, aspectWidth, aspectHeight
 }
 
 // Full snapshot of the entry state at a point in time
@@ -38,6 +38,20 @@ public class UndoCoordinator: ObservableObject {
     private var lastTypedCharForGrouping: Character?
     private var pendingGroupBreak = false
 
+    /// A typing run becomes its own undo step once the keyboard has been quiet this long.
+    /// Checking the gap only on the *next* keystroke (as this used to) left the group open
+    /// indefinitely during a pause, and charged the character that resumed typing to the
+    /// run that had already ended.  A timer closes the group when the pause happens.
+    var typingIdleInterval: TimeInterval = 1.0
+    private var idleCommit: DispatchWorkItem?
+
+    // The idle commit needs the same arguments the keystroke gave us.  Holding them here
+    // rather than in a callback keeps ContentView (and so this coordinator) out of the
+    // closure, which would otherwise retain itself through the view's @StateObject.
+    private weak var typingEntry: BlogEntry?
+    private var typingFocusedItemId: UUID?
+    private var typingSelectedItemId: UUID?
+
     // MARK: - Clear
 
     func clear() {
@@ -48,6 +62,7 @@ public class UndoCoordinator: ObservableObject {
         lastTypingTime = nil
         lastTypedCharForGrouping = nil
         pendingGroupBreak = false
+        cancelIdleCommit()
         canUndo = false
         canRedo = false
         undoActionName = ""
@@ -71,7 +86,8 @@ public class UndoCoordinator: ObservableObject {
                 // Preserve both the loaded image (if any) and the lazy-load URL
                 return .image(imageItem.resizedImage, imageItem.filename, imageItem.smallURL)
             case .video(let videoItem):
-                return .video(videoItem.youtubeURL, videoItem.title)
+                return .video(videoItem.youtubeURL, videoItem.title,
+                              videoItem.aspectWidth, videoItem.aspectHeight)
             }
         }
         return EntrySnapshot(
@@ -118,7 +134,50 @@ public class UndoCoordinator: ObservableObject {
         undoStack.append((before: before, after: after))
         redoStack.removeAll()
         pendingSnapshot = nil
+        cancelIdleCommit()
         updateState()
+    }
+
+    /// Number of committed actions; pass to `refreshLatestAfter(ifDepthIs:)`.
+    var actionCount: Int { undoStack.count }
+
+    /// Re-captures the "after" side of the most recent action.  An action whose result is
+    /// refined asynchronously — the video aspect lookup — would otherwise leave redo
+    /// reproducing the placeholder rather than the corrected state.  The depth check makes
+    /// this a no-op once anything else has been done in the meantime.
+    func refreshLatestAfter(
+        entry: BlogEntry,
+        ifDepthIs depth: Int,
+        focusedTextItemId: UUID?,
+        selectedItemId: UUID?
+    ) {
+        guard !isRestoring, undoStack.count == depth, let last = undoStack.last else { return }
+        let after = captureSnapshot(
+            entry: entry,
+            actionName: last.after.actionName,
+            focusedTextItemId: focusedTextItemId,
+            selectedItemId: selectedItemId
+        )
+        undoStack[undoStack.count - 1] = (before: last.before, after: after)
+    }
+
+    private func scheduleIdleCommit() {
+        cancelIdleCommit()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.isRestoring, let entry = self.typingEntry else { return }
+            self.commitTypingIfNeeded(
+                entry: entry,
+                focusedTextItemId: self.typingFocusedItemId,
+                selectedItemId: self.typingSelectedItemId
+            )
+        }
+        idleCommit = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + typingIdleInterval, execute: work)
+    }
+
+    private func cancelIdleCommit() {
+        idleCommit?.cancel()
+        idleCommit = nil
     }
 
     // MARK: - Typing Grouping
@@ -135,7 +194,7 @@ public class UndoCoordinator: ObservableObject {
 
         // Break the current group on timeout (2.5s pause) or sentence boundary
         if !needsTypingSnapshot && pendingSnapshot != nil {
-            let timedOut = lastTypingTime.map { now.timeIntervalSince($0) > 2.5 } ?? false
+            let timedOut = lastTypingTime.map { now.timeIntervalSince($0) > typingIdleInterval } ?? false
             if timedOut || pendingGroupBreak {
                 commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
                 needsTypingSnapshot = true
@@ -156,6 +215,10 @@ public class UndoCoordinator: ObservableObject {
         }
         lastTypedCharForGrouping = lastTypedChar
         lastTypingTime = now
+        typingEntry = entry
+        typingFocusedItemId = focusedTextItemId
+        typingSelectedItemId = selectedItemId
+        scheduleIdleCommit()
     }
 
     // Commit pending typing action (called before non-typing actions)
@@ -176,6 +239,7 @@ public class UndoCoordinator: ObservableObject {
             lastTypedCharForGrouping = nil
             pendingGroupBreak = false
         }
+        cancelIdleCommit()
     }
 
     // MARK: - Undo / Redo
@@ -253,8 +317,9 @@ public class UndoCoordinator: ObservableObject {
                     imageItem = ImageItem(resizedImage: NSImage(), filename: filename)
                 }
                 newItems.append(.image(imageItem))
-            case .video(let url, let title):
-                let videoItem = VideoItem(youtubeURL: url, title: title)
+            case .video(let url, let title, let aspectW, let aspectH):
+                let videoItem = VideoItem(youtubeURL: url, title: title,
+                                          aspectWidth: aspectW, aspectHeight: aspectH)
                 newItems.append(.video(videoItem))
             }
         }
