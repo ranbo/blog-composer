@@ -222,7 +222,7 @@ class BlogEntry: ObservableObject {
                         merged = a1
                     } else {
                         let m = NSMutableAttributedString(attributedString: a1)
-                        m.append(NSAttributedString(string: "\n\n", attributes: [.font: bodyFont()]))
+                        m.append(NSAttributedString(string: "\n", attributes: [.font: bodyFont()]))
                         m.append(a2)
                         merged = m
                     }

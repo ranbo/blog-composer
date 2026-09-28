@@ -208,6 +208,7 @@ public struct ContentView: View {
     @State private var showGmailSetup = false
     @State private var articleDate = Date()
     @State private var gcsBucket: String = UserDefaults.standard.string(forKey: "GCSBucket") ?? ""
+    @State private var contactEmail: String = Preferences.contactEmail
     @State private var showSyncError = false
     @State private var syncErrorMessage = ""
     @State private var isSyncing = false
@@ -258,23 +259,16 @@ public struct ContentView: View {
                         get: { entry.title },
                         set: { newValue in
                             if !undoCoordinator.isRestoring && previousTitle != newValue {
-                                undoCoordinator.commitTypingIfNeeded(
+                                // Title keystrokes group into runs like body text does,
+                                // rather than one undo step per character.
+                                undoCoordinator.handleTyping(
                                     entry: entry,
                                     focusedTextItemId: focusedTextItemId,
-                                    selectedItemId: selectedItemId
-                                )
-                                undoCoordinator.takeSnapshot(
-                                    entry: entry,
-                                    actionName: "Title Change",
-                                    focusedTextItemId: focusedTextItemId,
-                                    selectedItemId: selectedItemId
+                                    selectedItemId: selectedItemId,
+                                    lastTypedChar: newValue.last,
+                                    target: UndoCoordinator.titleTarget
                                 )
                                 entry.title = newValue
-                                undoCoordinator.commitAction(
-                                    entry: entry,
-                                    focusedTextItemId: focusedTextItemId,
-                                    selectedItemId: selectedItemId
-                                )
                                 previousTitle = newValue
                             } else {
                                 entry.title = newValue
@@ -408,6 +402,17 @@ public struct ContentView: View {
                         .onChange(of: gcsBucket) { _, newValue in
                             UserDefaults.standard.set(newValue, forKey: "GCSBucket")
                         }
+
+                    Text("Contact:")
+                        .foregroundColor(.secondary)
+                    TextField("you@example.com", text: $contactEmail)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 180)
+                        .help("Address behind the \"Email me\" link on the index page. "
+                              + "Written to contact.js as character codes, never as text in a page.")
+                        .onChange(of: contactEmail) { _, newValue in
+                            Preferences.contactEmail = newValue
+                        }
                 }
                 .font(.caption)
             }
@@ -437,6 +442,7 @@ public struct ContentView: View {
                 captionEditingId: $captionEditingId,
                 focusedTextItemId: $focusedTextItemId,
                 selectedItemIds: $selectedItemIds,
+                selectionAnchorId: $selectionAnchorId,
                 findScrollTargetId: $findScrollTargetId,
                 onNavigateUp: navigateUp,
                 onNavigateDown: navigateDown,
@@ -459,6 +465,11 @@ public struct ContentView: View {
                 onVideoEdit: beginEditingVideo,
                 onPaste: handlePaste,
                 onTextViewFocusChanged: { textView in
+                    // Putting the caret in a block ends any whole-block selection; the
+                    // caret and a block range are two different things to act on.
+                    if textView != nil && !selectedItemIds.isEmpty {
+                        selectedItemIds.removeAll()
+                    }
                     // Moving to another block ends the typing run, so undo can't reach back
                     // into text that is no longer on screen.
                     if textView !== focusedTextView {
@@ -479,15 +490,18 @@ public struct ContentView: View {
                                                          focusedTextItemId: focusedTextItemId,
                                                          selectedItemId: selectedItemId)
                 },
+                onTextViewShiftClick: handleTextShiftClick,
+                onSelectAllDocument: selectWholeArticle,
                 onImageURLsDrop: { urls, index, cursorPos in
                     importImages(urls: urls, at: index, cursorPosition: cursorPos)
                 },
-                onTextDidChange: { lastTypedChar in
+                onTextDidChange: { lastTypedChar, edit in
                     undoCoordinator.handleTyping(
                         entry: entry,
                         focusedTextItemId: focusedTextItemId,
                         selectedItemId: selectedItemId,
-                        lastTypedChar: lastTypedChar
+                        lastTypedChar: lastTypedChar,
+                        edit: edit
                     )
                 },
                 onUndo: performUndo,
@@ -753,7 +767,7 @@ public struct ContentView: View {
 
         try? FileManager.default.createBlogDirectoryStructure(at: baseURL)
 
-        undoCoordinator.commitTypingIfNeeded(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+        // Stays open until the import finishes, so the whole drop is one undo step.
         undoCoordinator.takeSnapshot(entry: entry, actionName: "Import Images", focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
 
         importProgress = (0, urls.count)
@@ -810,8 +824,13 @@ public struct ContentView: View {
                 await MainActor.run { importProgress = (count, urls.count) }
             }
 
-            if !processed.isEmpty {
-                await MainActor.run {
+            // Always close the action, even if nothing imported — an open action would
+            // swallow every later edit into this one undo step.
+            await MainActor.run {
+                defer {
+                    undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+                }
+                if !processed.isEmpty {
                     entry.insertImages(processed, at: dropIndex, cursorPosition: cursorPosition)
                     // Always clear selection after import so KeyHandlingView doesn't steal focus
                     selectedItemId = nil
@@ -822,7 +841,6 @@ public struct ContentView: View {
                        case .text(let textItem) = entry.items[newFocusIndex] {
                         focusedTextItemId = textItem.id
                     }
-                    undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
                 }
             }
         }
@@ -880,11 +898,20 @@ public struct ContentView: View {
                 SaveCoordinator.saveLastFilePath(publishedURL)
             }
             articleManager.refresh()
+            // Rebuild the index and every episode's chrome.  This is what gives the article
+            // published just before this one a "Next episode" link pointing here, so those
+            // files have to go up too — not just the new one.
+            let changedFolders = (try? TravelBlogPublisher.regenerateIndex(
+                domain: gcsBucket.isEmpty ? nil : gcsBucket)) ?? []
             // Sync to GCS if a bucket is configured. Without one the article is only
             // promoted locally, which must not be reported as a completed publish.
             if !gcsBucket.isEmpty {
                 let articleDir = publishedURL.deletingLastPathComponent()
                 try await TravelBlogPublisher.syncArticle(folderURL: articleDir, bucketName: gcsBucket)
+                let publishedFolder = articleDir.lastPathComponent
+                for folder in changedFolders where folder != publishedFolder {
+                    try await TravelBlogPublisher.uploadIndexHTML(folder: folder, bucketName: gcsBucket)
+                }
                 publishState = .success(publishedURL)
             } else {
                 publishState = .successLocalOnly(publishedURL)
@@ -1272,9 +1299,10 @@ public struct ContentView: View {
     }
 
     private func handleCut() {
-        undoCoordinator.commitTypingIfNeeded(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
-        undoCoordinator.takeSnapshot(entry: entry, actionName: "Cut", focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+        recordUndoable("Cut") { cutSelectedBlocks() }
+    }
 
+    private func cutSelectedBlocks() {
         let itemsToCut: [UUID]
 
         if !selectedItemIds.isEmpty {
@@ -1333,7 +1361,7 @@ public struct ContentView: View {
             switch (attrBefore, attrAfter) {
             case (let b?, let a?):
                 let m = NSMutableAttributedString(attributedString: b)
-                m.append(NSAttributedString(string: "\n\n",
+                m.append(NSAttributedString(string: "\n",
                     attributes: [.font: bodyFont(), .foregroundColor: NSColor.textColor]))
                 m.append(a)
                 return m
@@ -1369,8 +1397,6 @@ public struct ContentView: View {
         focusedTextItemId = mergedItem.id
         selectedItemId = nil
         selectedItemIds.removeAll()
-
-        undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
     }
 
     private func canCopy() -> Bool {
@@ -1433,28 +1459,27 @@ public struct ContentView: View {
         guard !clipboard.isEmpty else { return false }
         guard NSPasteboard.general.changeCount == clipboardPasteboardCount else { return false }
 
-        undoCoordinator.commitTypingIfNeeded(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
-        undoCoordinator.takeSnapshot(entry: entry, actionName: "Paste", focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
-
-        ensureImagesInCurrentArticle()
-
         // Determine where to paste
         if let focusedId = focusedTextItemId,
            let focusedIndex = entry.items.firstIndex(where: { $0.id == focusedId }),
            case .text(let textItem) = entry.items[focusedIndex] {
             // Paste into text area at cursor position
-            selectedItemId = nil
-            selectedItemIds.removeAll()
-            pasteIntoText(at: focusedIndex, textItem: textItem)
-            undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+            recordUndoable("Paste") {
+                ensureImagesInCurrentArticle()
+                selectedItemId = nil
+                selectedItemIds.removeAll()
+                pasteIntoText(at: focusedIndex, textItem: textItem)
+            }
             return true
         } else if let selectedId = selectedItemId,
                   let selectedIndex = entry.items.firstIndex(where: { $0.id == selectedId }) {
             // Paste after selected image (matching drag-and-drop behavior), then clear selection
-            selectedItemId = nil
-            selectedItemIds.removeAll()
-            pasteBeforeItem(at: selectedIndex + 1)
-            undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+            recordUndoable("Paste") {
+                ensureImagesInCurrentArticle()
+                selectedItemId = nil
+                selectedItemIds.removeAll()
+                pasteBeforeItem(at: selectedIndex + 1)
+            }
             return true
         }
 
@@ -1508,8 +1533,8 @@ public struct ContentView: View {
         if attrAfter.length > 0 {
             if insertIndex - 1 < entry.items.count,
                case .text(let pastedTextItem) = entry.items[insertIndex - 1] {
-                // Last pasted item is text — trim its trailing newlines, then separate with
-                // exactly one blank line before appending the "after" content
+                // Last pasted item is text — trim its trailing newlines, then start the
+                // "after" content as the next paragraph
                 let merged = NSMutableAttributedString(attributedString: pastedTextItem.attributedContent)
                 while merged.length > 0 {
                     let last = (merged.string as NSString).character(at: merged.length - 1)
@@ -1517,7 +1542,7 @@ public struct ContentView: View {
                     merged.deleteCharacters(in: NSRange(location: merged.length - 1, length: 1))
                 }
                 if merged.length > 0 {
-                    merged.append(NSAttributedString(string: "\n\n",
+                    merged.append(NSAttributedString(string: "\n",
                         attributes: [.font: bodyFont(), .foregroundColor: NSColor.textColor]))
                 }
                 merged.append(attrAfter)
@@ -1580,16 +1605,59 @@ public struct ContentView: View {
     }
 
     private func commitVideoEdit(_ videoItem: VideoItem, url: String, title: String?) {
-        undoCoordinator.commitTypingIfNeeded(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
-        undoCoordinator.takeSnapshot(entry: entry, actionName: "Edit Video",
-                                     focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
-        let result = entry.updateVideo(id: videoItem.id, url: url, title: title)
+        var result = (changed: false, urlChanged: false)
+        recordUndoable("Edit Video") {
+            let r = entry.updateVideo(id: videoItem.id, url: url, title: title)
+            result = (r.changed, r.urlChanged)
+        }
         guard result.changed else { return }
-        undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
         // A different video is a different shape, so measure it again.
         if result.urlChanged {
             lookUpVideoAspect(id: videoItem.id, url: url)
         }
+    }
+
+/// Shift-clicking from one block into another selects everything between them.
+    ///
+    /// Each text block is its own NSTextView, so AppKit sees two unrelated views and just
+    /// drops the caret where you clicked.  Selection therefore has to be modelled at the
+    /// article level: the range becomes a set of whole items, which is what cut, copy and
+    /// paste already operate on.  Returns false for a shift-click inside the block that
+    /// already has the caret, where AppKit's own extend-selection is what you want.
+    private func handleTextShiftClick(at index: Int) -> Bool {
+        guard entry.items.indices.contains(index) else { return false }
+        let clickedId = entry.items[index].id
+
+        // selectionAnchorId is where the selection started, and is only moved by a plain
+        // click.  focusedTextItemId is no use here: AppKit focuses the clicked block before
+        // mouseDown arrives, so it already points at the block being shift-clicked.
+        let anchorId = selectionAnchorId ?? selectedItemId
+        guard let anchorId,
+              anchorId != clickedId,
+              let anchorIndex = entry.items.firstIndex(where: { $0.id == anchorId })
+        else { return false }
+
+        let lo = min(anchorIndex, index), hi = max(anchorIndex, index)
+        selectionAnchorId = anchorId          // so a further shift-click extends from here
+        selectedItemIds = Set(entry.items[lo...hi].map { $0.id })
+        selectedItemId = nil
+        focusedTextItemId = nil
+        captionEditingId = nil
+        // Drop the caret so the text views stop showing an insertion point behind the
+        // block selection, and so Edit commands validate against the app, not a text view.
+        focusedTextView?.window?.makeFirstResponder(nil)
+        return true
+    }
+
+    /// Second Cmd-A: widen from the current block to the whole article.
+    private func selectWholeArticle() {
+        guard !entry.items.isEmpty else { return }
+        selectionAnchorId = entry.items.first?.id
+        selectedItemIds = Set(entry.items.map { $0.id })
+        selectedItemId = nil
+        focusedTextItemId = nil
+        captionEditingId = nil
+        focusedTextView?.window?.makeFirstResponder(nil)
     }
 
     private func handleVideoTap(videoItem: VideoItem, index: Int, modifiers: NSEvent.ModifierFlags) {
@@ -1611,9 +1679,10 @@ public struct ContentView: View {
     }
 
     private func applyFormatting(_ formatting: FormattingType) {
-        undoCoordinator.commitTypingIfNeeded(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
-        undoCoordinator.takeSnapshot(entry: entry, actionName: "\(formatting)", focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+        recordUndoable("\(formatting)") { applyFormattingInBlock(formatting) }
+    }
 
+    private func applyFormattingInBlock(_ formatting: FormattingType) {
         guard let textView = focusedTextView else {
             print("No focused text view")
             return
@@ -1673,15 +1742,11 @@ public struct ContentView: View {
             applyHeading(textView: textView, savedRange: savedRange, level: 3)
         case .bulletList:
             applyListStyle(textView: textView, savedRange: savedRange, ordered: false)
-            undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
             return  // Don't restore selection - applyListStyle handles it
         case .numberedList:
             applyListStyle(textView: textView, savedRange: savedRange, ordered: true)
-            undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
             return  // Don't restore selection - applyListStyle handles it
         }
-
-        undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
 
         // Restore focus and selection
         DispatchQueue.main.async {
@@ -1757,9 +1822,6 @@ public struct ContentView: View {
         guard let textView = focusedTextView,
               let textStorage = textView.textStorage else { return }
 
-        undoCoordinator.commitTypingIfNeeded(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
-        undoCoordinator.takeSnapshot(entry: entry, actionName: "Hyperlink", focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
-
         let trimmedURL = url.trimmingCharacters(in: .whitespaces)
         guard !trimmedURL.isEmpty, let linkURL = URL(string: trimmedURL) else {
             removeHyperlink()
@@ -1772,24 +1834,25 @@ public struct ContentView: View {
             .link: linkURL
         ]
 
-        textStorage.beginEditing()
-        if range.length == 0 && !text.isEmpty {
-            // Insert new linked text at cursor
-            textStorage.replaceCharacters(in: range, with: NSAttributedString(string: text, attributes: linkAttrs))
-        } else if range.length > 0 {
-            let currentText = (textStorage.string as NSString).substring(with: range)
-            if text != currentText {
-                // Replace text and apply link
+        recordUndoable("Hyperlink") {
+            textStorage.beginEditing()
+            if range.length == 0 && !text.isEmpty {
+                // Insert new linked text at cursor
                 textStorage.replaceCharacters(in: range, with: NSAttributedString(string: text, attributes: linkAttrs))
-            } else {
-                // Just update the link attribute
-                textStorage.addAttribute(.link, value: linkURL, range: range)
+            } else if range.length > 0 {
+                let currentText = (textStorage.string as NSString).substring(with: range)
+                if text != currentText {
+                    // Replace text and apply link
+                    textStorage.replaceCharacters(in: range, with: NSAttributedString(string: text, attributes: linkAttrs))
+                } else {
+                    // Just update the link attribute
+                    textStorage.addAttribute(.link, value: linkURL, range: range)
+                }
             }
-        }
-        textStorage.endEditing()
+            textStorage.endEditing()
 
-        textView.didChangeText()
-        undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+            textView.didChangeText()
+        }
     }
 
     private func removeHyperlink() {
@@ -1799,15 +1862,13 @@ public struct ContentView: View {
         let range = hyperlinkDialogRange
         guard range.length > 0 else { return }
 
-        undoCoordinator.commitTypingIfNeeded(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
-        undoCoordinator.takeSnapshot(entry: entry, actionName: "Remove Hyperlink", focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+        recordUndoable("Remove Hyperlink") {
+            textStorage.beginEditing()
+            textStorage.removeAttribute(.link, range: range)
+            textStorage.endEditing()
 
-        textStorage.beginEditing()
-        textStorage.removeAttribute(.link, range: range)
-        textStorage.endEditing()
-
-        textView.didChangeText()
-        undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+            textView.didChangeText()
+        }
     }
 
     private func applyHeading(textView: NSTextView, savedRange: NSRange, level: Int) {
@@ -2112,16 +2173,18 @@ public struct ContentView: View {
     private func updateImageCaption(id: UUID, caption: String?) {
         guard let index = entry.items.firstIndex(where: { $0.id == id }),
               case .image(var imageItem) = entry.items[index] else { return }
-        imageItem.caption = caption
-        entry.items[index] = .image(imageItem)
+        recordUndoable("Edit Caption") {
+            imageItem.caption = caption
+            entry.items[index] = .image(imageItem)
+        }
     }
 
     private func handleDelete() {
         guard let selectedId = selectedItemId else { return }
+        recordUndoable("Delete") { deleteSelectedItem(selectedId) }
+    }
 
-        undoCoordinator.commitTypingIfNeeded(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
-        undoCoordinator.takeSnapshot(entry: entry, actionName: "Delete", focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
-
+    private func deleteSelectedItem(_ selectedId: UUID) {
         // Find the selected item index
         guard let selectedIndex = entry.items.firstIndex(where: { $0.id == selectedId }) else { return }
 
@@ -2154,14 +2217,14 @@ public struct ContentView: View {
             let attrBefore = textBeforeItem?.attributedContent ?? NSAttributedString()
             let attrAfter = textAfterItem?.attributedContent ?? NSAttributedString()
 
-            // Combine attributed strings with blank line if both have content
+            // Combine attributed strings as separate paragraphs if both have content
             let combinedAttr: NSMutableAttributedString
             let cursorPos: Int
             if !attrBefore.string.isEmpty && !attrAfter.string.isEmpty {
                 combinedAttr = NSMutableAttributedString(attributedString: attrBefore)
-                combinedAttr.append(NSAttributedString(string: "\n\n"))
+                combinedAttr.append(NSAttributedString(string: "\n", attributes: [.font: bodyFont()]))
                 combinedAttr.append(attrAfter)
-                cursorPos = attrBefore.length + 1 // Position at the first newline
+                cursorPos = attrBefore.length // End of the first paragraph
             } else {
                 combinedAttr = NSMutableAttributedString(attributedString: attrBefore)
                 combinedAttr.append(attrAfter)
@@ -2195,11 +2258,20 @@ public struct ContentView: View {
         case .text:
             break
         }
-
-        undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
     }
 
     // MARK: - Undo / Redo
+
+    /// Runs `body` as one undo step.  The before/after pair can't come unbalanced however
+    /// `body` exits — a `return` between them used to leave the action open, which then
+    /// swallowed every later edit.
+    private func recordUndoable(_ actionName: String, _ body: () -> Void) {
+        undoCoordinator.takeSnapshot(entry: entry, actionName: actionName,
+                                     focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId)
+        body()
+        undoCoordinator.commitAction(entry: entry, focusedTextItemId: focusedTextItemId,
+                                     selectedItemId: selectedItemId)
+    }
 
     private func performUndo() {
         if let result = undoCoordinator.undo(into: entry, focusedTextItemId: focusedTextItemId, selectedItemId: selectedItemId) {
@@ -2356,7 +2428,9 @@ struct TextItemView: View {
     let onTextViewFocusChanged: (CustomNSTextView?) -> Void
     let onSelectionChanged: () -> Void
     let onTextViewMouseDown: () -> Void
-    let onTextDidChange: (Character?) -> Void
+    let onTextViewShiftClick: () -> Bool
+    let onSelectAllDocument: () -> Void
+    let onTextDidChange: (Character?, TypingEdit) -> Void
     var onUndo: (() -> Void)?
     var onRedo: (() -> Void)?
     var onEscapeKey: (() -> Void)?
@@ -2381,6 +2455,8 @@ struct TextItemView: View {
                 onTextViewFocusChanged: onTextViewFocusChanged,
                 onSelectionChanged: onSelectionChanged,
                 onTextViewMouseDown: onTextViewMouseDown,
+                onTextViewShiftClick: onTextViewShiftClick,
+                onSelectAllDocument: onSelectAllDocument,
                 onTextDidChange: onTextDidChange,
                 onUndo: onUndo,
                 onRedo: onRedo,
@@ -2412,7 +2488,9 @@ struct MacTextEditor: NSViewRepresentable {
     let onTextViewFocusChanged: (CustomNSTextView?) -> Void
     let onSelectionChanged: () -> Void
     let onTextViewMouseDown: () -> Void
-    let onTextDidChange: (Character?) -> Void
+    let onTextViewShiftClick: () -> Bool
+    let onSelectAllDocument: () -> Void
+    let onTextDidChange: (Character?, TypingEdit) -> Void
     var onUndo: (() -> Void)?
     var onRedo: (() -> Void)?
     var onEscapeKey: (() -> Void)?
@@ -2425,6 +2503,8 @@ struct MacTextEditor: NSViewRepresentable {
         textView.onFocusChanged = onTextViewFocusChanged
         textView.onSelectionChanged = onSelectionChanged
         textView.onMouseDown = onTextViewMouseDown
+        textView.onShiftClick = onTextViewShiftClick
+        textView.onSelectAllDocument = onSelectAllDocument
         textView.onUndo = onUndo
         textView.onRedo = onRedo
         textView.onEscapeKey = onEscapeKey
@@ -2475,6 +2555,8 @@ struct MacTextEditor: NSViewRepresentable {
         textView.onFocusChanged = onTextViewFocusChanged
         textView.onSelectionChanged = onSelectionChanged
         textView.onMouseDown = onTextViewMouseDown
+        textView.onShiftClick = onTextViewShiftClick
+        textView.onSelectAllDocument = onSelectAllDocument
         textView.onEscapeKey = onEscapeKey
         context.coordinator.parent = self
         context.coordinator.findRegistry = findRegistry
@@ -2482,8 +2564,11 @@ struct MacTextEditor: NSViewRepresentable {
         // Only update attributed text if we're not currently the first responder
         // (i.e., only update when focus changes or external updates occur)
         if textView.window?.firstResponder != textView {
-            if textView.attributedString() != textItem.attributedContent {
-                textView.textStorage?.setAttributedString(textItem.attributedContent)
+            // Shown with paragraph spacing, which text built outside the editor (loaded,
+            // pasted, merged, restored by undo) may not carry yet.
+            let display = ParagraphLayout.applied(to: textItem.attributedContent)
+            if textView.attributedString() != display {
+                textView.textStorage?.setAttributedString(display)
             }
         }
 
@@ -2581,13 +2666,31 @@ struct MacTextEditor: NSViewRepresentable {
                 let charIndex = str.index(str.startIndex, offsetBy: min(cursorPos - 1, str.count - 1))
                 lastTypedChar = str[charIndex]
             }
-            parent.onTextDidChange(lastTypedChar)
+            let edit = (textView as? CustomNSTextView)?.pendingTypingEdit ?? .keystroke
+            (textView as? CustomNSTextView)?.pendingTypingEdit = nil
+            parent.onTextDidChange(lastTypedChar, edit)
+
+            // Re-derive paragraph spacing: Return may have started a paragraph, or turned a
+            // list item or heading back into body text.
+            ParagraphLayout.apply(to: textStorage)
 
             // Update the attributed content (triggers SwiftUI re-render, which calls
             // updateNSView where height is recalculated — no need to do it here too)
             if let attributedString = textStorage.copy() as? NSAttributedString {
                 parent.textItem.attributedContent = attributedString
             }
+        }
+
+        /// Classifies the edit before it happens, while the selection it replaces is still
+        /// visible, so undo can make deleting or typing over a selection its own step.
+        func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange,
+                      replacementString: String?) -> Bool {
+            if let custom = textView as? CustomNSTextView, custom.pendingTypingEdit == nil,
+               textView.selectedRange().length > 0 {
+                custom.pendingTypingEdit = (replacementString ?? "").isEmpty
+                    ? .discrete("Delete") : .replaceSelection
+            }
+            return true
         }
 
         func textDidBeginEditing(_ notification: Notification) {
@@ -2690,9 +2793,18 @@ class CustomNSTextView: NSTextView {
     var onRedo: (() -> Void)?
     var onFocusChanged: ((CustomNSTextView?) -> Void)?
     var onSelectionChanged: (() -> Void)?
-    /// Fires on a click in the text, before the caret moves.  Used to end the current
-    /// typing run: a selection change alone is no good, because typing fires that too.
+    /// Fires after a click or a caret-movement key.  Used to end the current typing run:
+    /// a selection change alone is no good, because typing fires that too.
     var onMouseDown: (() -> Void)?
+    /// How the next text change should be grouped for undo; set by paste/cut/selection
+    /// edits and consumed in `textDidChange`.
+    var pendingTypingEdit: TypingEdit?
+    /// Shift-click that should extend a selection across blocks rather than move the
+    /// caret.  Returns true when the app took it over.
+    var onShiftClick: (() -> Bool)?
+    /// Cmd-A pressed when this block's text is already fully selected — widen to the
+    /// whole article.
+    var onSelectAllDocument: (() -> Void)?
     var onEscapeKey: (() -> Void)?
     private var justBecameFirstResponder = false
     /// Selection captured the moment Cmd-K fires, before the menu system can clear it.
@@ -2763,8 +2875,17 @@ class CustomNSTextView: NSTextView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        onMouseDown?()
+        // A shift-click reaching a *different* block is a range selection, not a caret
+        // move.  Each block is its own NSTextView, so AppKit has no idea the two are
+        // part of one document and would just drop the caret where you clicked.
+        if event.modifierFlags.contains(.shift), onShiftClick?() == true {
+            return
+        }
+        // super runs a modal tracking loop until mouse-up, so the notification goes
+        // afterwards: closing the undo run publishes SwiftUI state, and doing that while
+        // AppKit is tracking a click or drag can refresh the view mid-selection.
         super.mouseDown(with: event)
+        onMouseDown?()
     }
 
     override func becomeFirstResponder() -> Bool {
@@ -2831,6 +2952,12 @@ class CustomNSTextView: NSTextView {
         }
         // Check for Return key
         else if event.keyCode == 36 { // Return
+            // Shift-Return breaks the line inside the paragraph (<br>) — no gap, for
+            // poems — where Return starts a new paragraph (<p>).
+            if event.modifierFlags.contains(.shift) {
+                insertLineBreak(nil)
+                return
+            }
             if handleReturnKey() {
                 return
             }
@@ -2853,6 +2980,25 @@ class CustomNSTextView: NSTextView {
         }
 
         super.keyDown(with: event)
+
+        // Moving the caret by keyboard ends the typing run, like a click does, so text
+        // typed somewhere else is a separate undo step.
+        // Left, right, up, down, home, end, page up, page down.
+        if [123, 124, 125, 126, 115, 119, 116, 121].contains(event.keyCode) {
+            onMouseDown?()
+        }
+    }
+
+    override func cut(_ sender: Any?) {
+        pendingTypingEdit = .discrete("Cut")
+        defer { pendingTypingEdit = nil }
+        super.cut(sender)
+    }
+
+    override func pasteAsPlainText(_ sender: Any?) {
+        pendingTypingEdit = .discrete("Paste")
+        defer { pendingTypingEdit = nil }
+        super.pasteAsPlainText(sender)
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -2872,6 +3018,17 @@ class CustomNSTextView: NSTextView {
         if isCmd && char == "y" {
             onRedo?()
             return true
+        }
+
+        // Cmd-A selects this block; pressing it again widens to the whole article.
+        // (AppKit can only ever select within one text view, so the second press is ours.)
+        if isCmd && char == "a" && !isShift {
+            let whole = NSRange(location: 0, length: (string as NSString).length)
+            if selectedRange() == whole && whole.length > 0 {
+                onSelectAllDocument?()
+                return true
+            }
+            return super.performKeyEquivalent(with: event)
         }
 
         // Check for Cmd-V (paste)
@@ -3517,6 +3674,8 @@ class CustomNSTextView: NSTextView {
     // Called by NSTextView's paste: action (Cmd-V fallback when internal clipboard declined).
     // Normalises pasted content to supported attributes only, with guaranteed fallbacks.
     override func paste(_ sender: Any?) {
+        pendingTypingEdit = .discrete("Paste")
+        defer { pendingTypingEdit = nil }
         let pasteboard = NSPasteboard.general
 
         // HTML (most common when copying from browsers/web apps) — parse then normalize
@@ -3595,6 +3754,7 @@ struct EntryContentView: View {
     @Binding var captionEditingId: UUID?
     @Binding var focusedTextItemId: UUID?
     @Binding var selectedItemIds: Set<UUID>
+    @Binding var selectionAnchorId: UUID?
     @Binding var findScrollTargetId: UUID?
     let onNavigateUp: (Int) -> Void
     let onNavigateDown: (Int) -> Void
@@ -3611,8 +3771,11 @@ struct EntryContentView: View {
     let onTextViewFocusChanged: (CustomNSTextView?) -> Void
     let onSelectionChanged: () -> Void
     let onTextViewMouseDown: () -> Void
+    /// Shift-click in the text block at this index; true if it became a range selection.
+    let onTextViewShiftClick: (Int) -> Bool
+    let onSelectAllDocument: () -> Void
     let onImageURLsDrop: ([URL], Int, Int?) -> Void
-    let onTextDidChange: (Character?) -> Void
+    let onTextDidChange: (Character?, TypingEdit) -> Void
     var onUndo: (() -> Void)?
     var onRedo: (() -> Void)?
     @State private var dropTargetIndex: Int? = nil
@@ -3759,6 +3922,13 @@ struct EntryContentView: View {
                     if focused {
                         focusedTextItemId = textItem.id
                         selectedItemId = nil
+                        // AppKit focuses the clicked view *before* delivering mouseDown, so
+                        // by the time a shift-click is handled this has already moved to the
+                        // block being clicked.  Only a plain click may move the anchor —
+                        // otherwise a shift-click would anchor to itself and select nothing.
+                        if !NSEvent.modifierFlags.contains(.shift) {
+                            selectionAnchorId = textItem.id
+                        }
                     } else if focusedTextItemId == textItem.id {
                         focusedTextItemId = nil
                     }
@@ -3770,6 +3940,8 @@ struct EntryContentView: View {
                 onTextViewFocusChanged: onTextViewFocusChanged,
                 onSelectionChanged: onSelectionChanged,
                 onTextViewMouseDown: onTextViewMouseDown,
+                onTextViewShiftClick: { onTextViewShiftClick(index) },
+                onSelectAllDocument: onSelectAllDocument,
                 onTextDidChange: onTextDidChange,
                 onUndo: onUndo,
                 onRedo: onRedo,

@@ -219,7 +219,10 @@ public class TravelBlogPublisher {
         // Published to the same bucket but maintained outside TravelBlog.  Without this
         // the root sync's --delete-unmatched-destination-objects treats the whole section
         // as orphaned and deletes it, because nothing under TravelBlog corresponds to it.
-        "bob/.*"
+        "bob/.*",
+        // The welcome blurb is a source file baked into index.html at generate time —
+        // there is nothing for a reader to open at /welcome.html.
+        "(.*/)?welcome\\.html"
     ].joined(separator: ",")
 
     static func sync(bucketName: String,
@@ -273,6 +276,19 @@ public class TravelBlogPublisher {
 
     /// Syncs a single published article folder to GCS, then uploads the root
     /// index.html and util/ so the index stays current.
+    /// Uploads only one article's index.html.  Used for a neighbour whose "Next episode"
+    /// link changed because something newer was published — its images are already up.
+    static func uploadIndexHTML(folder: String, bucketName: String) async throws {
+        let file = travelBlogDir.appendingPathComponent(folder).appendingPathComponent("index.html")
+        guard FileManager.default.fileExists(atPath: file.path) else { return }
+        try await runGcloud([
+            "storage", "cp",
+            "--cache-control=no-cache",
+            file.path,
+            "gs://\(bucketName)/\(folder)/index.html"
+        ])
+    }
+
     static func syncArticle(folderURL: URL, bucketName: String) async throws {
         let folderName = folderURL.lastPathComponent
 
@@ -308,6 +324,19 @@ public class TravelBlogPublisher {
                 "gs://\(bucketName)/index.html"
             ])
         }
+
+        // 3b. Shared files at the TravelBlog root: blog.css, contact.js and the banner
+        // images every episode's header links to.  Without this they only ever reached the
+        // bucket on a full Sync, so a publish could put up a page whose stylesheet, banner
+        // or contact address was stale.  No --recursive, so this is just the top-level
+        // files; rsync compares them and uploads only what actually differs.
+        try await runGcloud([
+            "storage", "rsync",
+            travelBlogDir.path,
+            "gs://\(bucketName)",
+            "--exclude=\(rsyncExcludes)",
+            "--cache-control=no-cache"
+        ])
 
         // 4. Sync util/ (lightbox assets)
         let utilDir = travelBlogDir.appendingPathComponent("util")
@@ -588,7 +617,218 @@ public class TravelBlogPublisher {
     /// Scans TravelBlog/ and regenerates index.html from all YYYY-MM-DD_* folders.
     /// When `domain` is provided, also rewrites each article's <h1> title to link to its
     /// canonical URL (https://domain/folder/).
-    static func regenerateIndex(domain: String? = nil) throws {
+
+// MARK: - Welcome blurb
+
+    static let welcomeFileName = "welcome.html"
+
+    private static let defaultWelcomeHTML = """
+    <p class="site-intro">Welcome to Randy Wilson&#39;s travel blog. We love to explore the
+    world and meet wonderful people wherever we go! And I&#39;m always on the lookout for
+    good ice cream!</p>
+    """
+
+    /// Creates `welcome.html` with the default wording if it isn't there yet.  Never
+    /// overwrites it: once it exists, the file is the copy that matters.
+    static func ensureWelcomeFile() throws {
+        let url = travelBlogDir.appendingPathComponent(welcomeFileName)
+        guard !FileManager.default.fileExists(atPath: url.path) else { return }
+        try defaultWelcomeHTML.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// The blurb shown beside the banner, read from `welcome.html`.
+    ///
+    /// Anything starting with a tag is used as-is, so it can hold several paragraphs or a
+    /// link; plain text is wrapped in the styled paragraph so the file can just be prose.
+    static func welcomeHTML() -> String {
+        let url = travelBlogDir.appendingPathComponent(welcomeFileName)
+        let text = (try? String(contentsOf: url, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !text.isEmpty else { return defaultWelcomeHTML }
+        return text.hasPrefix("<") ? text : "<p class=\"site-intro\">\(text)</p>"
+    }
+
+    // MARK: - Shared contact script
+
+    /// Writes `contact.js` at the TravelBlog root.
+    ///
+    /// The address is emitted as character codes and assembled at click time, so it is
+    /// nowhere in any page as text — harvesters parse HTML, they don't run scripts.  Every
+    /// page loads this one file, so changing the address in Preferences and re-publishing
+    /// updates the whole site.  Any element with `data-contact` becomes a mail link.
+// MARK: - Per-episode chrome
+
+    // Both bands are wrapped in <div>, which HTMLParser ignores, so opening an article in
+    // the editor never turns them into content.  A re-save drops them and the next
+    // regenerateIndex puts them back, which also means they self-heal.
+    private static let chromeTopStart = "<!-- episode-chrome-top -->"
+    private static let chromeTopEnd = "<!-- /episode-chrome-top -->"
+    private static let chromeBottomStart = "<!-- episode-chrome-bottom -->"
+    private static let chromeBottomEnd = "<!-- /episode-chrome-bottom -->"
+
+    /// Inserts or refreshes the banner at the top and the next/home links at the bottom.
+    /// Returns true when the file changed, so the caller can upload just those articles.
+    @discardableResult
+    private static func applyEpisodeChrome(
+        to htmlFile: URL,
+        folder: String,
+        next: (folder: String, title: String)?
+    ) -> Bool {
+        guard var html = try? String(contentsOf: htmlFile, encoding: .utf8) else { return false }
+        let original = html
+
+        // The links sit inside the index page's iframe, so they must break out of it.
+        let top = """
+        \(chromeTopStart)
+          <div class="episode-header"><a href="../index.html?e=\(HTMLConverter.urlEncodePath(folder))" target="_top" title="Back to the index"><img src="../AdventuresHeader.png" alt="Adventures and Stuff"></a></div>
+        \(chromeTopEnd)
+        """
+
+        var bottomLines = ["  <hr>"]
+        if let next {
+            // Points straight at the episode, so reading an article on its own goes to the
+            // next article rather than bouncing through the index.  episode.js intercepts
+            // this when we are the index's reading pane and drives the list instead.
+            bottomLines.append("  <p class=\"next-episode\">Next episode: "
+                + "<a href=\"../\(HTMLConverter.urlEncodePath(next.folder))/\""
+                + " data-episode=\"\(escapeHTMLText(next.folder))\">"
+                + escapeHTMLText(next.title) + "</a></p>")
+        }
+        // Carries this episode, so the index opens with it selected and ready for up/down.
+        bottomLines.append("  <p class=\"home-link\">Home page: "
+            + "<a href=\"../index.html?e=\(HTMLConverter.urlEncodePath(folder))\" target=\"_top\">"
+            + "AdventuresAndStuff.com</a></p>")
+        bottomLines.append("  <script src=\"../episode.js\"></script>")
+        let bottom = """
+        \(chromeBottomStart)
+        <div class="episode-footer">
+        \(bottomLines.joined(separator: "\n"))
+        </div>
+        \(chromeBottomEnd)
+        """
+
+        html = replacingBand(in: html, start: chromeTopStart, end: chromeTopEnd, with: top,
+                             fallbackInsertAfter: "<body>")
+        html = replacingBand(in: html, start: chromeBottomStart, end: chromeBottomEnd, with: bottom,
+                             fallbackInsertBefore: ["<script>", "</body>"])
+
+        guard html != original else { return false }
+        try? html.write(to: htmlFile, atomically: true, encoding: .utf8)
+        return true
+    }
+
+    /// Replaces the text between two markers, or inserts it if the markers aren't there yet.
+    private static func replacingBand(
+        in html: String,
+        start: String,
+        end: String,
+        with replacement: String,
+        fallbackInsertAfter: String? = nil,
+        fallbackInsertBefore: [String]? = nil
+    ) -> String {
+        if let s = html.range(of: start), let e = html.range(of: end) {
+            return html.replacingCharacters(in: s.lowerBound..<e.upperBound, with: replacement)
+        }
+        if let anchor = fallbackInsertAfter, let r = html.range(of: anchor) {
+            return html.replacingCharacters(in: r.upperBound..<r.upperBound, with: "\n" + replacement)
+        }
+        if let anchors = fallbackInsertBefore {
+            for anchor in anchors {
+                if let r = html.range(of: anchor) {
+                    return html.replacingCharacters(in: r.lowerBound..<r.lowerBound,
+                                                    with: replacement + "\n")
+                }
+            }
+        }
+        return html
+    }
+
+    private static func escapeHTMLText(_ s: String) -> String {
+        s.replacingOccurrences(of: "&", with: "&amp;")
+         .replacingOccurrences(of: "<", with: "&lt;")
+         .replacingOccurrences(of: ">", with: "&gt;")
+         .replacingOccurrences(of: "\"", with: "&quot;")
+    }
+
+/// Writes `episode.js` at the TravelBlog root, shared by every episode page.
+    ///
+    /// It makes the "Next episode" link do the right thing in both places an article is
+    /// read: inside the index's reading pane it asks the index to select and load the next
+    /// episode, so the list stays in step and the arrow keys carry on; opened on its own it
+    /// just follows the link to that episode's page.
+    static func writeEpisodeScript() throws {
+        let js = """
+        // Generated by BlogComposer — do not edit by hand.
+        (function () {
+          function onClick(e) {
+            var a = e.target && e.target.closest ? e.target.closest("a[data-episode]") : null;
+            if (!a) return;
+            try {
+              // Only when we are the index's reading pane; otherwise let the link navigate.
+              if (window.parent !== window &&
+                  typeof window.parent.selectEpisodeByFolder === "function") {
+                if (window.parent.selectEpisodeByFolder(a.getAttribute("data-episode"))) {
+                  e.preventDefault();
+                }
+              }
+            } catch (err) {
+              // A cross-origin parent throws on access; the plain link is the fallback.
+            }
+            // Episode links are folder URLs, which only a web server resolves to their
+            // index.html; opened from disk, name the file.
+            if (!e.defaultPrevented && location.protocol === "file:" && a.href.slice(-1) === "/") {
+              e.preventDefault();
+              location.href = a.href + "index.html";
+            }
+          }
+          document.addEventListener("click", onClick);
+        })();
+        """
+        let url = travelBlogDir.appendingPathComponent("episode.js")
+        if let existing = try? String(contentsOf: url, encoding: .utf8), existing == js { return }
+        try js.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    static func writeContactScript() throws {
+        let address = Preferences.contactEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+        let codes = address.unicodeScalars.map { String($0.value) }.joined(separator: ",")
+        let js = """
+        // Generated by BlogComposer from the "Contact" setting — do not edit by hand.
+        // The address is stored as character codes so it never appears as text in a page.
+        (function () {
+          var c = [\(codes)];
+          if (!c.length) return;
+          function address() {
+            var s = "";
+            for (var i = 0; i < c.length; i++) { s += String.fromCharCode(c[i]); }
+            return s;
+          }
+          function wire() {
+            var els = document.querySelectorAll("[data-contact]");
+            for (var i = 0; i < els.length; i++) {
+              els[i].addEventListener("click", function (e) {
+                e.preventDefault();
+                window.location.href = "mail" + "to:" + address();
+              });
+            }
+          }
+          if (document.readyState === "loading") {
+            document.addEventListener("DOMContentLoaded", wire);
+          } else {
+            wire();
+          }
+        })();
+        """
+        let url = travelBlogDir.appendingPathComponent("contact.js")
+        // Leave the file alone when nothing changed, so rsync has no reason to re-upload it.
+        if let existing = try? String(contentsOf: url, encoding: .utf8), existing == js { return }
+        try js.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// Rebuilds the index and every episode's chrome.  Returns the folders whose
+    /// article HTML changed, so a publish can upload exactly those.
+    @discardableResult
+    static func regenerateIndex(domain: String? = nil) throws -> [String] {
         let contents = try FileManager.default.contentsOfDirectory(
             at: travelBlogDir, includingPropertiesForKeys: [.isDirectoryKey], options: .skipsHiddenFiles)
 
@@ -613,10 +853,12 @@ public class TravelBlogPublisher {
             let htmlFile = FileManager.default.fileExists(atPath: indexURL.path) ? indexURL : legacyURL
             let title = readTitle(from: htmlFile) ?? folderName
 
-            // Fix the article's <h1> self-link if a domain is provided
-            if let domain = domain, !domain.isEmpty {
-                fixTitleLink(in: htmlFile, folderName: folderName, domain: domain)
-            }
+            // Published from Drafts, the file still points at ../../TravelBlog/ for its
+            // stylesheet; from here that is one level above the site root.
+            fixAssetPrefix(in: htmlFile)
+
+            // A heading that links to the page you are on is noise; drop the anchor.
+            unlinkSelfLinkedHeadings(in: htmlFile, folderName: folderName)
 
             // Rewrite legacy full/ image hrefs → web/ and non-jpg small/ srcs → .jpg
             fixLegacyImageLinks(in: htmlFile)
@@ -630,43 +872,94 @@ public class TravelBlogPublisher {
         // Sort newest-first
         entries.sort { $0.date > $1.date }
 
+        // Refresh each episode's banner and next/home links.  Doing it here, from the whole
+        // sorted list, means publishing a new article automatically repairs the previous
+        // one's "Next episode" link — and that any article that drifted is put right.
+        var changedFolders: [String] = []
+        for (i, e) in entries.enumerated() {
+            // entries is newest-first, so the *next* episode chronologically is the one before.
+            let next: (folder: String, title: String)? =
+                i == 0 ? nil : (folder: entries[i - 1].folder, title: entries[i - 1].title)
+            let dir = travelBlogDir.appendingPathComponent(e.folder)
+            let indexURL = dir.appendingPathComponent("index.html")
+            let legacyURL = dir.appendingPathComponent("\(e.folder).html")
+            let htmlFile = FileManager.default.fileExists(atPath: indexURL.path) ? indexURL : legacyURL
+            if applyEpisodeChrome(to: htmlFile, folder: e.folder, next: next) {
+                changedFolders.append(e.folder)
+            }
+        }
+
+        try writeContactScript()
+        try writeEpisodeScript()
+        try ensureWelcomeFile()
+
         // Generate index HTML
-        let html = buildIndexHTML(entries: entries)
+        let html = buildIndexHTML(entries: entries, welcome: welcomeHTML())
         let indexURL = travelBlogDir.appendingPathComponent("index.html")
         try html.write(to: indexURL, atomically: true, encoding: .utf8)
+        return changedFolders
     }
 
     /// Rewrites the first <h1> in `htmlFile` so it links to the article's canonical URL.
     /// Handles both plain <h1>Title</h1> and Blogger-style <h1><a href="...blogger...">Title</a></h1>.
-    private static func fixTitleLink(in htmlFile: URL, folderName: String, domain: String) {
+/// Repoints an article's stylesheet/asset links after it has been published.
+    ///
+    /// HTMLConverter derives the prefix from where the file sits: a draft reaches the
+    /// shared assets via `../../TravelBlog/`, a published article via `../`.  Publishing
+    /// saves the HTML *before* moving the folder out of Drafts, so the file arrives with
+    /// the draft's prefix — which, served from the bucket root, resolves above it and
+    /// 404s.  The page then renders with no stylesheet at all.
+    private static func fixAssetPrefix(in htmlFile: URL) {
+        guard var content = try? String(contentsOf: htmlFile, encoding: .utf8),
+              content.contains("../../TravelBlog/") else { return }
+        content = content.replacingOccurrences(of: "\"../../TravelBlog/", with: "\"../")
+        content = content.replacingOccurrences(of: "'../../TravelBlog/", with: "'../")
+        try? content.write(to: htmlFile, atomically: true, encoding: .utf8)
+    }
+
+    /// Removes self-referential links from an article's headings.
+    ///
+    /// A title that links to the page you are already reading goes nowhere useful.
+    /// Downloaded articles linked theirs to the Blogger post and our own output linked it
+    /// to itself; worse, the previous version of this matched the first <h1> in the file,
+    /// which in an article whose title is an <h2 class='entry-title'> is a body heading —
+    /// so section headings like "St. Thomas" ended up linked to the page they sit on.
+    /// Keyed on the article's own folder, so a heading that links somewhere else is left
+    /// alone. The headings and their text are untouched.
+    private static func unlinkSelfLinkedHeadings(in htmlFile: URL, folderName: String) {
         guard var content = try? String(contentsOf: htmlFile, encoding: .utf8) else { return }
-        let targetURL = "https://\(domain)/\(folderName)/"
+        let original = content
 
-        guard let h1Regex = try? NSRegularExpression(pattern: #"<h1[^>]*>([\s\S]*?)</h1>"#) else { return }
-        let fullRange = NSRange(content.startIndex..., in: content)
-        guard let match = h1Regex.firstMatch(in: content, range: fullRange) else { return }
+        guard let headings = try? NSRegularExpression(
+            pattern: #"<h[123][^>]*>[\s\S]*?</h[123]>"#, options: .caseInsensitive),
+            let anchor = try? NSRegularExpression(
+                pattern: #"<a[^>]*href=['"]([^'"]*)['"][^>]*>([\s\S]*?)</a>"#,
+                options: .caseInsensitive)
+        else { return }
 
-        // Strip inner tags to get the plain-text (but HTML-entity-preserved) title
-        let innerRange = Range(match.range(at: 1), in: content)!
-        let innerHTML = String(content[innerRange])
-        guard let stripTagsRegex = try? NSRegularExpression(pattern: "<[^>]+>") else { return }
-        let titleText = stripTagsRegex.stringByReplacingMatches(
-            in: innerHTML,
-            range: NSRange(innerHTML.startIndex..., in: innerHTML),
-            withTemplate: ""
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard !titleText.isEmpty else { return }
-
-        // Skip if the <h1> already links to the correct URL
-        let existingH1 = (content as NSString).substring(with: match.range)
-        if existingH1.contains("href=\"\(targetURL)\"") || existingH1.contains("href='\(targetURL)'") { return }
-
-        let newH1 = "<h1><a href=\"\(targetURL)\" style=\"text-decoration: none; color: inherit;\">\(titleText)</a></h1>"
-        if let matchRange = Range(match.range, in: content) {
-            content.replaceSubrange(matchRange, with: newH1)
-            try? content.write(to: htmlFile, atomically: true, encoding: .utf8)
+        let matches = headings.matches(in: content,
+                                       range: NSRange(content.startIndex..., in: content))
+        for m in matches.reversed() {                    // reversed: earlier ranges stay valid
+            guard let range = Range(m.range, in: content) else { continue }
+            let heading = String(content[range])
+            var rebuilt = heading
+            let inner = anchor.matches(in: heading,
+                                       range: NSRange(heading.startIndex..., in: heading))
+            for a in inner.reversed() {
+                guard let whole = Range(a.range, in: heading),
+                      let href = Range(a.range(at: 1), in: heading),
+                      let text = Range(a.range(at: 2), in: heading) else { continue }
+                // Only a link back to this same article counts as self-referential.
+                guard heading[href].contains("/\(folderName)/") else { continue }
+                rebuilt.replaceSubrange(
+                    Range(uncheckedBounds: (whole.lowerBound, whole.upperBound)),
+                    with: String(heading[text]))
+            }
+            if rebuilt != heading { content.replaceSubrange(range, with: rebuilt) }
         }
+
+        guard content != original else { return }
+        try? content.write(to: htmlFile, atomically: true, encoding: .utf8)
     }
 
     /// Patches legacy image links in-place:
@@ -740,7 +1033,8 @@ public class TravelBlogPublisher {
         return raw.isEmpty ? nil : ArticleManager.unescapeHTML(raw)
     }
 
-    private static func buildIndexHTML(entries: [(folder: String, date: String, title: String)]) -> String {
+    private static func buildIndexHTML(entries: [(folder: String, date: String, title: String)],
+                                       welcome: String) -> String {
         // Group by year
         var yearGroups: [(year: String, entries: [(folder: String, date: String, title: String)])] = []
         var currentYear = ""
@@ -763,7 +1057,9 @@ public class TravelBlogPublisher {
                     .replacingOccurrences(of: "<", with: "&lt;")
                     .replacingOccurrences(of: ">", with: "&gt;")
                     .replacingOccurrences(of: "'", with: "&#39;")
-                let path = "\(e.folder)/index.html"
+                // The folder alone, with its trailing slash: the web server serves the
+                // index.html inside (a bare "folder" would cost a redirect first).
+                let path = "\(e.folder)/"
                 rows += "    <tr class='row-\(group.year)' onclick=\"selectRow(this, '\(path)')\"><td class=\"date-cell\">\(e.date)</td><td><a href='\(path)' target='_blank'>\(escapedTitle)</a></td></tr>\n"
             }
         }
@@ -772,10 +1068,26 @@ public class TravelBlogPublisher {
         <html>
         <head>
           <meta charset="UTF-8">
-          <title>Travel Blog</title>
+          <title>Adventures and Stuff</title>
           <style>
-            body { margin: 0; padding: 0; }
-            .container { display: flex; height: 100vh; }
+            /* blog.css is deliberately not linked here: it styles article pages, and its
+               800px body cap would squeeze this two-pane layout. */
+            body { margin: 0; padding: 0; display: flex; flex-direction: column; height: 100vh;
+                   font-family: Georgia, 'Times New Roman', Times, serif; }
+            .site-header { display: flex; align-items: center; gap: 22px; padding: 14px 18px;
+                           border-bottom: 1px solid #ccc; flex: 0 0 auto; }
+            .site-banner { width: 380px; max-width: 42%; height: auto; flex: 0 0 auto; }
+            /* The header is a row (banner | blurb); the blurb itself is a column, so a
+               welcome.html with several paragraphs stacks instead of spreading sideways. */
+            .site-intro-block { flex: 1 1 auto; min-width: 0; }
+            .site-intro { margin: 0 0 8px; font-size: 1.05em; line-height: 1.5; }
+            .site-intro:last-of-type { margin-bottom: 10px; }
+            .site-contact { margin: 0; }
+            .site-contact a { color: #36c; }
+            .index-footer { padding: 14px 10px 24px; border-top: 1px solid #ddd;
+                            margin-top: 10px; text-align: center; }
+            .index-footer a { color: #36c; }
+            .container { display: flex; flex: 1 1 auto; min-height: 0; }
             .table-pane { flex-basis: 550px; flex-shrink: 0; flex-grow: 0; min-width: 200px; overflow-y: auto; }
             .divider { width: 5px; background: #ccc; cursor: ew-resize; position: relative; z-index: 10; }
             .iframe-pane { flex: 1 1 0; overflow-y: auto; }
@@ -797,13 +1109,41 @@ public class TravelBlogPublisher {
                 if (hidden) rows[i].classList.add('hidden'); else rows[i].classList.remove('hidden');
               }
             }
+            // Selects an episode by folder name and shows it.  Used by the ?e= bootstrap
+            // below and called from the reading pane by episode.js, so a "Next episode"
+            // link followed inside the index keeps the list and the pane in step.
+            // Returns true when the episode was found and selected.
+            function selectEpisodeByFolder(folder) {
+              var target = folder + '/';
+              var rows = document.querySelectorAll('tr[class*="row-"]:not(.year-row):not(.width-keeper)');
+              for (var i = 0; i < rows.length; i++) {
+                var onclick = rows[i].getAttribute('onclick') || '';
+                if (onclick.indexOf("'" + target + "'") >= 0) {
+                  rows[i].classList.remove('hidden');
+                  selectRow(rows[i], target);
+                  rows[i].scrollIntoView({ block: 'nearest' });
+                  return true;
+                }
+              }
+              return false;
+            }
+            // Episode links are folder URLs ("2026-01-20_x/"), which a web server resolves
+            // to the index.html inside.  Opened from disk (file://) there is no server to
+            // do that, so the file name is added back.
+            function pageURL(path) {
+              return location.protocol === 'file:' && path.slice(-1) === '/' ? path + 'index.html' : path;
+            }
             function selectRow(row, htmlFile) {
               var selected = document.querySelector('tr.selected');
               if (selected) selected.classList.remove('selected');
               row.classList.add('selected');
-              document.getElementById('reading-pane').src = htmlFile;
+              document.getElementById('reading-pane').src = pageURL(htmlFile);
             }
             window.onload = function() {
+              var links = document.querySelectorAll('.table-pane a[href]');
+              for (var i = 0; i < links.length; i++) {
+                links[i].setAttribute('href', pageURL(links[i].getAttribute('href')));
+              }
               var divider = document.getElementById('divider');
               var container = document.querySelector('.container');
               var tablePane = document.querySelector('.table-pane');
@@ -831,24 +1171,50 @@ public class TravelBlogPublisher {
                   var rows = Array.from(document.querySelectorAll('tr[class*="row-"]:not(.year-row):not(.width-keeper):not(.hidden)'));
                   var idx = rows.indexOf(selected);
                   var next = e.key === 'ArrowUp' ? rows[idx - 1] : rows[idx + 1];
-                  if (next) { selected.classList.remove('selected'); next.classList.add('selected'); iframe.src = next.getAttribute('onclick').match(/'([^']+)'/)[1]; }
+                  if (next) { selected.classList.remove('selected'); next.classList.add('selected'); iframe.src = pageURL(next.getAttribute('onclick').match(/'([^']+)'/)[1]); }
                 }
               });
             };
           </script>
         </head>
         <body>
+        <div class="site-header">
+          <img class="site-banner" src="AdventuresAndStuff.png" alt="Adventures and Stuff">
+          <div class="site-intro-block">
+        \(welcome)
+            <p class="site-contact"><a href="#" data-contact>&#9993; Send E-mail</a></p>
+          </div>
+        </div>
         <div class="container">
           <div class="table-pane">
             <table style="width:100%;border-collapse:collapse;">
         \(rows)
             </table>
+            <div class="index-footer">
+              <a href="#" data-contact>&#9993; Contact by E-mail</a>
+            </div>
           </div>
           <div class="divider" id="divider"></div>
           <div class="iframe-pane">
             <iframe id="reading-pane" style="width:100%;height:100%;border:none;" src=""></iframe>
           </div>
         </div>
+        <script src="contact.js"></script>
+        <script>
+          // An episode's banner links back here as index.html?e=<folder>, so the article it
+          // came from is selected and shown, and the arrow keys carry on from there.
+          (function () {
+            var m = location.search.match(/[?&]e=([^&]+)/);
+            if (m && selectEpisodeByFolder(decodeURIComponent(m[1]))) return;
+            // Nothing asked for, or it no longer exists: open the newest episode, which is
+            // the first row because the list is built newest-first.  Arriving at the site
+            // with an empty reading pane looks broken.
+            var rows = document.querySelectorAll('tr[class*="row-"]:not(.year-row):not(.width-keeper)');
+            if (!rows.length) return;
+            var file = (rows[0].getAttribute('onclick') || '').match(/'([^']+)'/);
+            if (file) { selectRow(rows[0], file[1]); }
+          })();
+        </script>
         </body>
         </html>
         """

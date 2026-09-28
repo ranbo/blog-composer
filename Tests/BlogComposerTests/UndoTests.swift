@@ -147,6 +147,170 @@ final class UndoTests: XCTestCase {
 }
 
 @MainActor
+final class UndoGroupingTests: XCTestCase {
+    private func text(_ e: BlogEntry, _ i: Int = 0) -> String {
+        if case .text(let t) = e.items[i] { return t.content }
+        return ""
+    }
+    private func setText(_ e: BlogEntry, _ s: String, _ i: Int = 0) {
+        if case .text(let t) = e.items[i] { t.content = s }
+    }
+    /// One keystroke the way the editor reports it: coordinator first, then the model.
+    private func type(_ u: UndoCoordinator, _ e: BlogEntry, _ result: String,
+                      edit: TypingEdit = .keystroke) {
+        u.handleTyping(entry: e, focusedTextItemId: e.items[0].id, selectedItemId: nil,
+                       lastTypedChar: result.last, edit: edit)
+        setText(e, result)
+    }
+
+    /// The reported bug.  Bold calls didChangeText, which reported as typing *inside* the
+    /// Bold action; that overwrote the action's "before" and left the typing tracker
+    /// stuck, so nothing typed afterwards was recorded.  Undo then jumped back past all
+    /// of it, and redo offered the old action instead of what was just undone.
+    func testTypingAfterFormattingIsRecorded() {
+        let e = BlogEntry()
+        e.items = [.text(TextItem(content: "one"))]
+        let u = UndoCoordinator()
+
+        u.takeSnapshot(entry: e, actionName: "bold", focusedTextItemId: nil, selectedItemId: nil)
+        type(u, e, "ONE")   // the didChangeText echo from inside the action
+        u.commitAction(entry: e, focusedTextItemId: nil, selectedItemId: nil)
+        XCTAssertEqual(u.undoActionName, "bold")
+
+        type(u, e, "ONE t")
+        type(u, e, "ONE tw")
+        XCTAssertEqual(u.undoActionName, "Typing", "the new run must be undoable")
+
+        u.undo(into: e, focusedTextItemId: nil, selectedItemId: nil)
+        XCTAssertEqual(text(e), "ONE", "undo reverts only the latest typing")
+        XCTAssertEqual(u.redoActionName, "Typing", "redo offers what was just undone")
+
+        u.redo(into: e, focusedTextItemId: nil, selectedItemId: nil)
+        XCTAssertEqual(text(e), "ONE tw", "redo brings the typing back")
+
+        u.undo(into: e, focusedTextItemId: nil, selectedItemId: nil)
+        u.undo(into: e, focusedTextItemId: nil, selectedItemId: nil)
+        XCTAssertEqual(text(e), "one", "second undo reverts the formatting")
+    }
+
+    /// An action that changes nothing must not leave a step to be "undone".
+    func testNoOpActionLeavesNoStep() {
+        let e = BlogEntry()
+        e.items = [.text(TextItem(content: "x"))]
+        let u = UndoCoordinator()
+        u.takeSnapshot(entry: e, actionName: "bold", focusedTextItemId: nil, selectedItemId: nil)
+        u.commitAction(entry: e, focusedTextItemId: nil, selectedItemId: nil)
+        XCTAssertFalse(u.canUndo)
+    }
+
+    /// Brackets nest; the outer action records one step and typing resumes afterwards.
+    func testNestedActionsRecordOnce() {
+        let e = BlogEntry()
+        e.items = [.text(TextItem(content: "a"))]
+        let u = UndoCoordinator()
+        u.takeSnapshot(entry: e, actionName: "Hyperlink", focusedTextItemId: nil, selectedItemId: nil)
+        u.takeSnapshot(entry: e, actionName: "Remove Hyperlink", focusedTextItemId: nil, selectedItemId: nil)
+        setText(e, "b")
+        u.commitAction(entry: e, focusedTextItemId: nil, selectedItemId: nil)
+        u.commitAction(entry: e, focusedTextItemId: nil, selectedItemId: nil)
+        XCTAssertEqual(u.actionCount, 1)
+        XCTAssertFalse(u.isActionOpen)
+        type(u, e, "bc")
+        u.undo(into: e, focusedTextItemId: nil, selectedItemId: nil)
+        XCTAssertEqual(text(e), "b")
+    }
+
+    /// Paste, cut and deleting a selection are each their own step, and nothing typed
+    /// after them joins them.
+    func testDiscreteEditsAreTheirOwnSteps() {
+        let e = BlogEntry()
+        e.items = [.text(TextItem(content: ""))]
+        let u = UndoCoordinator()
+        type(u, e, "a")
+        type(u, e, "ab")
+        type(u, e, "ab PASTED", edit: .discrete("Paste"))
+        XCTAssertEqual(u.undoActionName, "Paste")
+        type(u, e, "ab PASTEDc")
+
+        u.undo(into: e, focusedTextItemId: nil, selectedItemId: nil)
+        XCTAssertEqual(text(e), "ab PASTED")
+        u.undo(into: e, focusedTextItemId: nil, selectedItemId: nil)
+        XCTAssertEqual(text(e), "ab")
+        u.undo(into: e, focusedTextItemId: nil, selectedItemId: nil)
+        XCTAssertEqual(text(e), "")
+    }
+
+    /// Typing over a selection starts a new run, so undo restores the selected text
+    /// without also removing what was typed before it.
+    func testReplacingSelectionStartsNewRun() {
+        let e = BlogEntry()
+        e.items = [.text(TextItem(content: ""))]
+        let u = UndoCoordinator()
+        type(u, e, "hello world")
+        type(u, e, "hello X", edit: .replaceSelection)
+        type(u, e, "hello XY")
+        u.undo(into: e, focusedTextItemId: nil, selectedItemId: nil)
+        XCTAssertEqual(text(e), "hello world")
+    }
+
+    /// Typing in a different block is a different run.
+    func testSwitchingBlocksBreaksTheRun() {
+        let e = BlogEntry()
+        e.items = [.text(TextItem(content: "")), .text(TextItem(content: ""))]
+        let u = UndoCoordinator()
+        u.handleTyping(entry: e, focusedTextItemId: e.items[0].id, selectedItemId: nil, lastTypedChar: "a")
+        setText(e, "a", 0)
+        u.handleTyping(entry: e, focusedTextItemId: e.items[1].id, selectedItemId: nil, lastTypedChar: "b")
+        setText(e, "b", 1)
+        u.undo(into: e, focusedTextItemId: nil, selectedItemId: nil)
+        XCTAssertEqual(text(e, 0), "a")
+        XCTAssertEqual(text(e, 1), "")
+    }
+
+    /// Undo used to rebuild images from a few hand-picked fields and dropped captions,
+    /// so undoing anything wiped every caption in the article.
+    func testUndoKeepsImageCaptions() {
+        let e = BlogEntry()
+        var img = ImageItem(filename: "a.jpg", smallURL: URL(fileURLWithPath: "/tmp/a.jpg"))
+        img.caption = "Sunset"
+        e.items = [.text(TextItem(content: "x")), .image(img), .text(TextItem(content: ""))]
+        let u = UndoCoordinator()
+        type(u, e, "xy")
+        u.undo(into: e, focusedTextItemId: nil, selectedItemId: nil)
+        guard case .image(let restored) = e.items[1] else { return XCTFail() }
+        XCTAssertEqual(restored.caption, "Sunset")
+    }
+
+    /// Restored text items are new objects, so focus is carried by position.
+    func testUndoRestoresCaretBlock() {
+        let e = BlogEntry()
+        e.items = [.text(TextItem(content: "first")), .text(TextItem(content: "second"))]
+        let u = UndoCoordinator()
+        let target = e.items[1].id
+        u.handleTyping(entry: e, focusedTextItemId: target, selectedItemId: nil, lastTypedChar: "!")
+        setText(e, "second!", 1)
+        let r = u.undo(into: e, focusedTextItemId: target, selectedItemId: nil)
+        XCTAssertNotNil(r?.focusedTextItemId)
+        XCTAssertEqual(r?.focusedTextItemId, e.items[1].id, "caret returns to the edited block")
+    }
+
+    /// Typing after an undo discards redo immediately; a redo pressed mid-run must not
+    /// overwrite the new text.
+    func testTypingAfterUndoClearsRedo() {
+        let e = BlogEntry()
+        e.items = [.text(TextItem(content: ""))]
+        let u = UndoCoordinator()
+        type(u, e, "a")
+        u.undo(into: e, focusedTextItemId: nil, selectedItemId: nil)
+        XCTAssertTrue(u.canRedo)
+        type(u, e, "b")
+        XCTAssertFalse(u.canRedo)
+        u.redo(into: e, focusedTextItemId: nil, selectedItemId: nil)
+        XCTAssertEqual(text(e), "b")
+    }
+}
+
+@MainActor
 final class UndoTimerTests: XCTestCase {
     /// A pause in typing should close the run on its own, without waiting for the next
     /// keystroke — otherwise a long pause leaves the group open and the character that
@@ -253,5 +417,52 @@ final class VideoTitleTests: XCTestCase {
         entry.items[1] = .video(VideoItem(youtubeURL: "https://youtu.be/abc123XYZ_-", title: "   "))
         let blank = HTMLConverter.convert(entry: entry, imageMap: [:], domain: nil)
         XCTAssertFalse(blank.contains(" title=\""), "a whitespace-only title is not a title")
+    }
+}
+
+@MainActor
+final class BlockSelectionTests: XCTestCase {
+    /// Cut/copy act on `selectedItemIds`, so a shift-click range has to land there —
+    /// and it must cover every item between the two blocks, media included.
+    private func article() -> BlogEntry {
+        let e = BlogEntry()
+        e.items = [.text(TextItem(content: "one")),
+                   .image(ImageItem(filename: "a.jpg", smallURL: URL(fileURLWithPath: "/tmp/a.jpg"))),
+                   .text(TextItem(content: "two")),
+                   .video(VideoItem(youtubeURL: "https://youtu.be/abc123XYZ_-", title: nil)),
+                   .text(TextItem(content: "three"))]
+        return e
+    }
+
+    /// The range between two block indices, as the handler computes it.
+    private func range(_ e: BlogEntry, _ a: Int, _ b: Int) -> Set<UUID> {
+        let lo = min(a, b), hi = max(a, b)
+        return Set(e.items[lo...hi].map { $0.id })
+    }
+
+    func testRangeSpansInterveningMedia() {
+        let e = article()
+        let sel = range(e, 0, 4)
+        XCTAssertEqual(sel.count, 5, "every item between the two text blocks is included")
+        XCTAssertTrue(sel.contains(e.items[1].id), "the image between them is selected")
+        XCTAssertTrue(sel.contains(e.items[3].id), "the video between them is selected")
+    }
+
+    func testRangeIsOrderIndependent() {
+        let e = article()
+        XCTAssertEqual(range(e, 4, 2), range(e, 2, 4),
+                       "shift-clicking upwards selects the same items as downwards")
+    }
+
+    func testSingleBlockRangeIsJustThatBlock() {
+        let e = article()
+        XCTAssertEqual(range(e, 2, 2), Set([e.items[2].id]))
+    }
+
+    /// Selecting the whole article is what the second Cmd-A does.
+    func testWholeArticleCoversEveryItem() {
+        let e = article()
+        XCTAssertEqual(Set(e.items.map { $0.id }).count, e.items.count)
+        XCTAssertEqual(Set(e.items.map { $0.id }), range(e, 0, e.items.count - 1))
     }
 }

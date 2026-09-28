@@ -7,6 +7,6 @@
 import Foundation
 
 public enum BuildInfo {
-    public static let version = "1.7"
-    public static let buildDate = "2026-09-21 at 1:55 PM"
+    public static let version = "1.20"
+    public static let buildDate = "2026-09-27 at 2:45 PM"
 }

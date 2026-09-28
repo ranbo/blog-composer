@@ -63,10 +63,14 @@ class HTMLParser {
         let doc = try XMLDocument(data: htmlData, options: [.documentTidyHTML])
 
         // Extract title
+        // Trimmed: tidy can leave the heading's surrounding newline in stringValue, which
+        // would then be written back inside <title> and the <h1> on every save.
         if let titleNode = try doc.nodes(forXPath: "//h1").first {
-            entry.title = titleNode.stringValue ?? ""
+            entry.title = (titleNode.stringValue ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
         } else if let titleNode = try doc.nodes(forXPath: "//title").first {
-            entry.title = titleNode.stringValue ?? ""
+            entry.title = (titleNode.stringValue ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
         // Extract body content
@@ -93,6 +97,9 @@ class HTMLParser {
 
         var skippedTitleH1 = false
         var lastNonEmptyWasHeading = false
+        // True when the text so far ends in an empty paragraph at the very start of a text
+        // block ("\n"): the next paragraph fills that open line rather than adding another.
+        var openLine = false
         for child in bodyNode.children ?? [] {
             guard let element = child as? XMLElement else { continue }
 
@@ -215,18 +222,21 @@ class HTMLParser {
                                 currentTextContent.deleteCharacters(in: NSRange(location: currentTextContent.length - 1, length: 1))
                             }
                         }
-                        if currentTextContent.length > 0 {
+                        if currentTextContent.length > 0 && !openLine {
                             currentTextContent.append(NSAttributedString(string: "\n"))
                         }
+                        openLine = false
                         currentTextContent.append(attributed)
                         lastNonEmptyWasHeading = isH1
-                    } else if currentTextContent.length > 0 && !lastNonEmptyWasHeading {
-                        // Empty <p></p> represents a blank line — skip if last element was a heading
-                        let lastChar = (currentTextContent.string as NSString).character(at: currentTextContent.length - 1)
-                        if lastChar != 10 {
-                            currentTextContent.append(NSAttributedString(string: "\n"))
-                        }
+                    } else if (element.stringValue ?? "").contains("\u{00A0}") && !lastNonEmptyWasHeading {
+                        // <p>&nbsp;</p> is an empty paragraph typed on purpose; it shows as a
+                        // gap in the browser, so it is one in the editor too.
+                        if currentTextContent.length == 0 { openLine = true }
+                        currentTextContent.append(NSAttributedString(string: "\n", attributes: [.font: bodyFont()]))
                     }
+                    // A bare <p></p> is dropped.  Older articles have one wherever a blank
+                    // line was typed between paragraphs, but the browser never showed them
+                    // (paragraph spacing does that job), so the editor doesn't either.
                 }
 
             case "h2", "h3", "ul", "ol":
@@ -245,9 +255,10 @@ class HTMLParser {
                             currentTextContent.deleteCharacters(in: NSRange(location: currentTextContent.length - 1, length: 1))
                         }
                     }
-                    if currentTextContent.length > 0 {
+                    if currentTextContent.length > 0 && !openLine {
                         currentTextContent.append(NSAttributedString(string: "\n"))
                     }
+                    openLine = false
                     currentTextContent.append(attributed)
                     lastNonEmptyWasHeading = isHeading
                 }
@@ -273,9 +284,10 @@ class HTMLParser {
                     // Plain hyperlink (YouTube or otherwise) — keep it as inline text.
                     let attributed = try parseElement(element, baseURL: baseURL)
                     if !attributed.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        if currentTextContent.length > 0 {
+                        if currentTextContent.length > 0 && !openLine {
                             currentTextContent.append(NSAttributedString(string: "\n"))
                         }
+                        openLine = false
                         currentTextContent.append(attributed)
                         lastNonEmptyWasHeading = false
                     }
@@ -372,9 +384,14 @@ class HTMLParser {
                 let ch = (raw.string as NSString).character(at: trimLen - 1)
                 if ch == 10 || ch == 13 || ch == 32 || ch == 9 { trimLen -= 1 } else { break }
             }
-            let trimmed = trimLen < raw.length
-                ? raw.attributedSubstring(from: NSRange(location: 0, length: trimLen))
-                : raw
+            // …and leading whitespace, which a browser doesn't show either.  (Indentation
+            // that should show is written as &nbsp;, and survives this.)
+            var lead = 0
+            while lead < trimLen {
+                let ch = (raw.string as NSString).character(at: lead)
+                if ch == 10 || ch == 13 || ch == 32 || ch == 9 { lead += 1 } else { break }
+            }
+            let trimmed = raw.attributedSubstring(from: NSRange(location: lead, length: trimLen - lead))
 
             // Check for heading sizes
             if element.name?.lowercased() == "h1" {
@@ -425,6 +442,12 @@ class HTMLParser {
             break
         }
 
+        // The converter writes indentation as non-breaking spaces; in the editor they are
+        // just spaces again (and get re-protected on the next save).
+        let ns = result.string as NSString
+        for i in 0..<ns.length where ns.character(at: i) == 0xA0 {
+            result.replaceCharacters(in: NSRange(location: i, length: 1), with: " ")
+        }
         return result
     }
 
@@ -437,10 +460,20 @@ class HTMLParser {
                 // Plain text — always stamp the body font so NSTextView
                 // doesn't fall back to Helvetica for unformatted runs.
                 if let content = child.stringValue {
-                    result.append(NSAttributedString(string: content,
+                    // A browser shows a run of ordinary spaces as one; only the
+                    // non-breaking spaces the converter writes are meant to show.
+                    let collapsed = content.replacingOccurrences(
+                        of: "[ \t]{2,}", with: " ", options: .regularExpression)
+                    result.append(NSAttributedString(string: collapsed,
                                                      attributes: [.font: bodyFont()]))
                 }
             } else if let childElement = child as? XMLElement {
+                if childElement.name?.lowercased() == "br" {
+                    // A line break inside the paragraph (Shift-Return in the editor).
+                    result.append(NSAttributedString(string: String(ParagraphLayout.lineBreak),
+                                                     attributes: [.font: bodyFont()]))
+                    continue
+                }
                 let childContent = try parseInlineContent(childElement)
 
                 switch childElement.name?.lowercased() {

@@ -5,6 +5,17 @@ import Foundation
 /// Settings stored in `UserDefaults`.
 public enum Preferences {
 
+    /// Address behind the "Email me" link on the index page.
+    ///
+    /// It is never written into any page.  `TravelBlogPublisher` emits it as character
+    /// codes in `contact.js` at the TravelBlog root, which every page shares, so changing
+    /// it here and re-publishing updates the whole site from one file.
+    public static var contactEmail: String {
+        get { UserDefaults.standard.string(forKey: contactEmailKey) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: contactEmailKey) }
+    }
+    public static let contactEmailKey = "ContactEmail"
+
     /// The domain used before the executable was wrapped in an app bundle.
     ///
     /// `UserDefaults.standard` is keyed by the main bundle's identifier. Run as a

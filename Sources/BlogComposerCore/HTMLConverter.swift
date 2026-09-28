@@ -58,11 +58,9 @@ class HTMLConverter {
         if !formattedDate.isEmpty {
             html += "  <h3 class=\"date-header\">\(escapeHTML(formattedDate))</h3>\n"
         }
-        if let link = selfLink {
-            html += "  <h1><a href=\"\(link)\">\(escapeHTML(entry.title))</a></h1>\n\n"
-        } else {
-            html += "  <h1>\(escapeHTML(entry.title))</h1>\n\n"
-        }
+        // The heading is plain text: a link on the title of the page you are already
+        // reading goes nowhere useful.  Getting back to the index is the banner's job.
+        html += "  <h1>\(escapeHTML(entry.title))</h1>\n\n"
 
         // Convert each item
         for (index, item) in entry.items.enumerated() {
@@ -191,6 +189,9 @@ class HTMLConverter {
         var html = ""
         var lines = text.components(separatedBy: "\n")
         var currentPosition = 0
+        // Paragraph text with its indentation and spacing made non-collapsing (lists read
+        // their nesting from the plain spaces, so they keep using `attributedText`).
+        let spaced = preservingSpaces(attributedText)
 
         // Trim trailing empty lines (prevents spurious <p></p> from list trailing newlines
         // and NSTextView's automatic trailing newline)
@@ -206,7 +207,9 @@ class HTMLConverter {
             let lineLength = (line as NSString).length
 
             if line.trimmingCharacters(in: .whitespaces).isEmpty {
-                html += "  <p></p>\n"
+                // An empty paragraph typed on purpose.  A bare <p></p> collapses to nothing
+                // in the browser, so give it content to show the gap the editor shows.
+                html += "  <p>&nbsp;</p>\n"
                 currentPosition += lineLength + 1
                 i += 1
                 continue
@@ -264,7 +267,7 @@ class HTMLConverter {
             } else {
                 // Regular paragraph - enumerate through all attribute runs
                 let lineRange = NSRange(location: currentPosition, length: lineLength)
-                let formatted = convertRunsToHTML(attributedText, inRange: lineRange)
+                let formatted = convertRunsToHTML(spaced, inRange: lineRange)
 
                 // Determine if it's a heading based on first character's font
                 if lineLength > 0 && currentPosition < attributedText.length {
@@ -273,11 +276,11 @@ class HTMLConverter {
                         let size = font.pointSize
                         // H1=28, H2=22, H3=18, body=17
                         if size >= 25 {  // 28 (H1)
-                            html += "  <h1>\(convertRunsToHTML(attributedText, inRange: lineRange, isHeading: true))</h1>\n"
+                            html += "  <h1>\(convertRunsToHTML(spaced, inRange: lineRange, isHeading: true))</h1>\n"
                         } else if size >= 20 {  // 22 (H2)
-                            html += "  <h2>\(convertRunsToHTML(attributedText, inRange: lineRange, isHeading: true))</h2>\n"
+                            html += "  <h2>\(convertRunsToHTML(spaced, inRange: lineRange, isHeading: true))</h2>\n"
                         } else if size > kBodyFontSize {  // 18 (H3), body=17
-                            html += "  <h3>\(convertRunsToHTML(attributedText, inRange: lineRange, isHeading: true))</h3>\n"
+                            html += "  <h3>\(convertRunsToHTML(spaced, inRange: lineRange, isHeading: true))</h3>\n"
                         } else {
                             html += "  <p>\(formatted)</p>\n"
                         }
@@ -449,7 +452,7 @@ class HTMLConverter {
             guard effectiveRange.length > 0 else { return }
 
             let substring = (attributedText.string as NSString).substring(with: effectiveRange)
-            var formatted = escapeHTML(substring)
+            var formatted = escapeText(substring)
 
             let isLink = attrs[.link] != nil
 
@@ -544,8 +547,47 @@ class HTMLConverter {
     /// Characters safe in URL paths (letters, digits, `-._~!$'()*+,;=:@`) are left alone;
     /// everything else (notably `#`, `?`, `%`, `[`, `]`, `&`, space) is encoded.
     /// Call escapeHTML() on the result before embedding in an HTML attribute.
-    private static func urlEncodePath(_ s: String) -> String {
+    static func urlEncodePath(_ s: String) -> String {
         s.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? s
+    }
+
+    /// Body text: escaped, with Shift-Return line breaks as <br> and tabs as fixed spaces
+    /// (a browser would collapse a tab to a single space).
+    private static func escapeText(_ text: String) -> String {
+        escapeHTML(text)
+            .replacingOccurrences(of: "&#8232;", with: "<br>")
+            .replacingOccurrences(of: "\t", with: "&#160;&#160;&#160;&#160;")
+    }
+
+    /// Replaces the spaces a browser would collapse with non-breaking ones, so indented
+    /// lines (poems) keep their indent: every space at the start of a line, and all but
+    /// the last space of a run within one (the last stays breakable so lines can wrap).
+    /// Same length as the input, so ranges into it stay valid.
+    static func preservingSpaces(_ text: NSAttributedString) -> NSAttributedString {
+        let ns = text.string as NSString
+        let m = NSMutableAttributedString(attributedString: text)
+        var i = 0
+        var atLineStart = true
+        while i < ns.length {
+            let c = ns.character(at: i)
+            if c == 0x20 {
+                var j = i
+                while j < ns.length && ns.character(at: j) == 0x20 { j += 1 }
+                let atLineEnd = j == ns.length || ns.character(at: j) == 0x0A || ns.character(at: j) == 0x2028
+                if !atLineEnd {
+                    let end = atLineStart ? j : j - 1
+                    for k in i..<end {
+                        m.replaceCharacters(in: NSRange(location: k, length: 1), with: "\u{00A0}")
+                    }
+                }
+                atLineStart = false
+                i = j
+                continue
+            }
+            atLineStart = c == 0x0A || c == 0x2028 || (atLineStart && c == 0x09)
+            i += 1
+        }
+        return m
     }
 
     private static func escapeHTML(_ text: String) -> String {

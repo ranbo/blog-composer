@@ -14,8 +14,11 @@ img {
     max-height: 640px;
     width: auto;
     height: auto;
-    cursor: zoom-in;
 }
+
+/* Only photos that actually open the lightbox promise a zoom; this used to be on
+   every img, which put a zoom cursor on the header banner that navigates instead. */
+a.lightbox-link img { cursor: zoom-in; }
 
 h1 a { text-decoration: none; color: inherit; }
 
@@ -59,4 +62,48 @@ iframe.YOUTUBE-iframe-video {
 .entry-title a:hover {
     color: #7700d9;
     text-decoration: underline;
+}
+
+/* ---- Per-episode chrome, maintained by TravelBlogPublisher.regenerateIndex ---- */
+
+/* Banner at the top left of an episode, with the date alongside it rather than
+   below, so the chrome costs one line instead of two. */
+.episode-header {
+    float: left;
+    margin: 0 14px 6px 0;
+}
+.episode-header img {
+    display: block;
+    height: 42px;
+    width: auto;
+    cursor: pointer;
+    border-radius: 3px;
+    /* Transparent by default so the hover highlight can't shift the layout. */
+    outline: 2px solid transparent;
+    outline-offset: 3px;
+    transition: outline-color 0.15s ease-in-out;
+}
+.episode-header a:hover img,
+.episode-header a:focus-visible img {
+    outline-color: #36c;
+}
+.episode-header + .date-header {
+    margin-top: 10px;
+}
+
+.episode-footer {
+    clear: both;
+    margin-top: 32px;
+}
+.episode-footer hr {
+    border: none;
+    border-top: 1px solid #ccc;
+    margin-bottom: 12px;
+}
+.episode-footer p {
+    margin: 6px 0;
+}
+.episode-footer .home-link {
+    color: grey;
+    font-size: 0.9em;
 }

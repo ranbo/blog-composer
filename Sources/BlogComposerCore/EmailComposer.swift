@@ -82,6 +82,7 @@ class EmailComposer {
 
             // Skip empty blocks
             let bare = inner.replacingOccurrences(of: "&nbsp;", with: "")
+                            .replacingOccurrences(of: "&#160;", with: "")
                             .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !bare.isEmpty else { continue }
 
