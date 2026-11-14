@@ -2,6 +2,17 @@
 
 A native macOS app for composing blog posts and emails with images.
 
+**[Privacy Policy](PRIVACY.md)**
+
+## YouTube Uploads
+
+Blog Composer can upload videos you drop into it to your own **YouTube** channel, then
+embed them in your post. This feature uses YouTube API Services; by using it you agree to
+the [YouTube Terms of Service](https://www.youtube.com/t/terms), and your use is covered by
+the [Google Privacy Policy](https://policies.google.com/privacy). See the
+[Blog Composer Privacy Policy](PRIVACY.md) for what the app accesses and stores, and how to
+revoke its access.
+
 ## Features
 
 - **Drag & Drop Images**: Drop images anywhere in your text to insert them
