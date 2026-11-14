@@ -2,7 +2,7 @@
 
 A native macOS app for composing blog posts and emails with images.
 
-**[Privacy Policy](PRIVACY.md)**
+**[Privacy Policy](PRIVACY.md)** · **[Terms of Service](TERMS.md)**
 
 ## YouTube Uploads
 
